@@ -114,6 +114,8 @@ Key modules in `songml-utils/src/songml_utils/`:
 | `html_exporter.py` | `to_html_string(doc, bars_per_row=...)` — renders a beat-grid chord chart as standalone HTML |
 | `web_server.py` | `songml-serve` CLI — LAN `ThreadingHTTPServer` that lists `.songml` files under `--root` and serves them as HTML chord charts and MIDI downloads; `--reload` re-parses on each request for live editing; `--force-port-grab` kills whatever process is listening on `--port` (SIGTERM then SIGKILL) and takes it over |
 | `validate.py` | CLI: parses AST to JSON, warns about structural issues |
+| `mixroom.py` | Mix layer for the mixroom Live over AbletonOSC (design: `docs/mixroom-transport-design.md`): holds UDP 127.0.0.1:11001, polls while watched, guarded play/stop/locate/mute with read-after-write. `osc.py` is its stdlib OSC codec |
+| `fake_abletonosc.py` | Loopback fake AbletonOSC for tests and off-rig dev (`python -m songml_utils.fake_abletonosc`); reproduces the M0 rig quirks |
 | `midi_inspector.py` / `midi_inspector_cli.py` | `songml-inspect-midi` CLI — reports tempo, time/key signature, notes, and instruments from a `.mid` file via `pretty_midi` |
 | `chord_voicings.py` | Loads `data/chord_voicings.tsv` → maps chord symbols to MIDI note offsets; shared by MIDI/ABC export and the Ableton pipeline |
 | `voicing_validator.py` | Validates `chord_voicings.tsv` entries against `pychord` music theory; standalone `data/voicing-validator.py` script wraps it for one-off table checks |

@@ -100,14 +100,32 @@ replaced by "the mix layer". Les's "generally sounds good" covers them.
   `0.0.0.0:11000`; query replies go to `<sender IP>:11001`; listener pushes
   and `/live/test` go to `127.0.0.1:11001`; messages are processed on
   Live's ~100 ms tick. The calls this design uses:
-  `/live/song/{start_playing, continue_playing, stop_playing}`,
+  `/live/song/{continue_playing, stop_playing}`,
   `/live/song/get/{is_playing, current_song_time, tempo,
   signature_numerator, signature_denominator, num_tracks}`,
   `/live/song/set/current_song_time`,
-  `/live/song/get/track_data <from> <to> track.name track.mute ...`, and
+  `/live/song/get/track_data <from> <to> track.name track.mute ...`,
+  `/live/track/get/{name, mute} <i>` and
   `/live/track/set/mute <i> <0|1>`. Track addressing is by index into
   `song.tracks`, which means normal and group tracks in arrangement order,
   without returns or master.
+- **Located while stopped is not where Play starts** (M0 row 3, measured
+  on the rig 2026-11-22, #14). While Live is stopped,
+  `set/current_song_time` reads back the new value, but `start_playing`
+  starts at the start marker and `continue_playing` resumes at the last
+  stop position. A set while *playing* moves the playhead. So Play is
+  **play-then-locate**: `continue_playing` followed at once by
+  `set/current_song_time <the stopped position>`, in one burst (§3.3).
+  `start_playing` is not used. The cost is a few milliseconds of audio
+  from the last stop position before the jump; if that's audible at the
+  rig in M2, M2 mutes the master for the burst.
+- **11001 stays bound for the mix layer's whole life** (found in M0 row 1,
+  #14). On Windows, a reply AbletonOSC sends to an unheld 11001 comes back
+  as ICMP port-unreachable and kills its receive loop
+  (`ConnectionResetError: [WinError 10054]` in `abletonosc.log`). The mix
+  layer never closes and reopens the socket between watched periods, and
+  on shutdown it stops polling and waits out in-flight replies before it
+  closes (§2.5).
 
 ## 2. Where songml-serve runs, and the mix layer inside it
 
@@ -286,7 +304,9 @@ Options I rejected:
   fails, songml-serve exits non-zero at startup with a message naming the
   port and the holder's PID. systemd restarts it and the journal shows
   why. It never falls back to another port, and it never starts without
-  the mix layer when `--mixroom` was asked for.
+  the mix layer when `--mixroom` was asked for. Once bound, it holds the
+  port until the process exits, and drains in-flight replies before it
+  closes (§1, WinError 10054).
 - When Live isn't running or AbletonOSC isn't loaded, the server stays up
   and reports `live: "unreachable"`, and the panel says so in words.
 
@@ -339,7 +359,7 @@ response carries the resulting state:
 
 | endpoint | what it sends | guard (refusal → HTTP 409 with reason) | re-read before reply |
 |---|---|---|---|
-| `POST /api/mix/play` | `start_playing` **or** `continue_playing`, per spike row 3 | refused if a fresh `is_playing` read is true: **never retrigger while playing** (Les's rule, 2026-10-31) | `is_playing` |
+| `POST /api/mix/play` | **play-then-locate** (M0 row 3, §1): reads the stopped `current_song_time` (the position the panel shows), then `continue_playing` + `set/current_song_time <that position>` in one burst | refused if a fresh `is_playing` read is true: **never retrigger while playing** (Les's rule, 2026-10-31) | `is_playing`, and `current_song_time` within the beats Live can have played since the burst (+¼ beat) of the target |
 | `POST /api/mix/stop` | `stop_playing` | refused if already stopped, so the API never issues Live's second-stop "return to start" by accident | `is_playing`, `current_song_time` |
 | `POST /api/mix/locate {beat}` | `set/current_song_time beat` | refused while playing (position is set while stopped); `beat ≥ 0` | `current_song_time` |
 | `POST /api/mix/mute {index, name, mute}` | `track/set/mute index 0/1` | refused if the track at `index` no longer has `name` (the page is stale after a set change) | that track's `mute` |
@@ -468,7 +488,7 @@ throughout.
 | slice | content | tested by | depends |
 |---|---|---|---|
 | **M0 spike** (~45 min, mixroom Live open, Les's OK to touch it) | probe script from WSL (`tools/spike/mixosc.py`, deleted after) plus a throwaway listener on 8080 | rows below | — |
-| **M1 mix layer** | `mixroom.py` (OSC codec, poll loop, watched-window, guards, read-after-write) and a **fake AbletonOSC** (loopback UDP sim of the calls in §1, scripted state) | pytest against the fake: every guard and refusal, stale-index mute, unreachable after 1.5 s, `tracks_rev` bump on set change, confirmation timeout, loud exit when 11001 is taken | M0 rows 1–3 |
+| **M1 mix layer** | `mixroom.py` (OSC codec, poll loop, watched-window, guards, read-after-write) and a **fake AbletonOSC** (loopback UDP sim of the calls in §1, scripted state) | pytest against the fake: every guard and refusal, stale-index mute, unreachable after 1.5 s, `tracks_rev` bump on set change, confirmation timeout, loud exit when 11001 is taken. The fake reproduces both M0 findings: a stopped locate is ignored by `start_playing`/`continue_playing`, and a reply to an unheld 11001 kills its receive loop | M0 rows 1–3 (done 2026-11-22, #14) |
 | **M2 serve + panel** | `--mixroom`, the `/api/mix/*` routes (token-gated), the panel in `html_exporter` (CSS/JS beside `_EDIT_CSS`/`_EDIT_JS`) | pytest: routes, token, 404 without `--mixroom`, no panel without token; browser in music-tools against the fake; at the rig (WSL, §2.3): Les mutes and plays from the piano | M1 |
 | **M3 move + deploy** | `songml` user with dotkit + songml kit; fstab drvfs mount (§2.3); unit in `stablebeast-hive/units`; token file; Hyper-V rule if row 4 needs it; firewall rule (§5); `coder-templates` music-tools `dev_port=0` + reprovision; music-tools init stops starting serve | M0 rows 4–7 re-run against the deployed unit; the touchscreen opens a chart and saves an edit | M2, §9 decisions |
 | *phase 2* | §6 | — | M2 |
@@ -485,7 +505,7 @@ down for about as long as the reprovision takes.
 |---|---|---|
 | 1 | From WSL: `/live/test` → 127.0.0.1:11000 | `"ok"` arrives on 127.0.0.1:11001 in WSL (AbletonOSC is loaded and mirrored loopback carries UDP both ways) |
 | 2 | `get/track_data 0 N track.name track.mute track.is_grouped track.color`; set mute on one throwaway track and clear it again | names and mutes match Live's UI; the UI follows the set |
-| 3 | Stopped. `set/current_song_time` to bar 9, then `start_playing`; stop; repeat with `continue_playing` | which one starts at the located position. The mix layer uses that one, and only that one (no try-A-then-B) |
+| 3 | Stopped. `set/current_song_time` to bar 9, then `start_playing`; stop; repeat with `continue_playing` | which one starts at the located position. The mix layer uses that one, and only that one (no try-A-then-B). **Result (2026-11-22): neither does**; a locate sticks only while playing, so Play is play-then-locate (§1, §3.3) |
 | 4 | music-tools stopped (or a spare port, e.g. 8092, if Les won't stop it yet): a throwaway listener in WSL on `0.0.0.0:<port>`; fetch it from the touchscreen, from a LAN host and from outside via the ddns name | reachable all three ways. If not, record whether the Hyper-V firewall is what blocks it; that sets M3's Les step |
 | 5 | After the UDP 11000 rule (§5): `/live/test` from another LAN host | no reply, while row 1 still passes |
 | 6 | As `songml`, through the fstab mount: write a scratch `.songml` file under Sheets, then delete it | it appears in Windows Explorer and Dropbox syncs it |
