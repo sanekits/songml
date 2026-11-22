@@ -1,55 +1,64 @@
 # Mixroom transport and track mutes in songml-serve: design
 
-*Mark, 2026-11-21, wake 20261121-184009-374489, for sanekits/songml#14.
-This is a design document. It contains no code.*
+*Mark, 2026-11-21, for sanekits/songml#14. Rev 1: wake
+20261121-184009-374489. Rev 2: wake 20261121-214011-470852, answering
+Les's question on #15 (move songml-serve out of Coder into WSL?). This is a
+design document. It contains no code.*
 
 Tags: **[Les]** marks a decision that belongs to Les. Each one is also
 listed as a single line in §9. **[default]** marks an engineering choice
 I've made; if nobody objects, it stands. **[spike]** marks something only
 the rig can answer.
 
+**What changed in rev 2.** Yes, moving songml-serve into WSL makes this
+simpler, and rev 2 does it. songml-serve runs in the hive WSL distro
+under systemd, as its own unprivileged user. The separate
+`songml-mixbridge` process, its HTTP API, the `--mix-url` proxy and the
+container→WSL hop are all gone. The mixroom code becomes a module inside
+songml-serve that talks to AbletonOSC over loopback. §2 weighs the move:
+what gets simpler, what it costs, and the options I rejected. Rev 1 also
+had a factual error, which the move removes rather than fixes. It had the
+container reaching WSL at the docker bridge gateway `172.17.0.1`, but
+Docker on Stablebeast is **Docker Desktop**, whose containers run in
+Docker Desktop's own VM. That address is that VM's bridge, not the hive
+distro. The real path would have been `host.docker.internal` → Windows →
+mirrored networking → WSL, which nobody has tested. Rev 1's spike row 4
+would have caught it. Sections 3–6 are rev 1's design with "bridge"
+replaced by "the mix layer". Les's "generally sounds good" covers them.
+
 ---
 
 ## 0. Summary
 
-1. **The relay is a small new process, `songml-mixbridge`, and it has to
-   run on Stablebeast itself, not inside the Coder container.** AbletonOSC
-   sends replies to `<sender IP>:11001`, and it sends listener pushes and
-   `/live/test` to **127.0.0.1:11001 only** (`osc_server.py`, `send()`
-   with no address). The fixed reply port breaks any relay behind the
-   container's NAT, and the loopback-only pushes rule out anything that
-   isn't on Stablebeast's loopback. WSL on Stablebeast runs in **mirrored**
-   networking mode (`wslinfo --networking-mode` prints `mirrored`), so a
-   WSL process on 127.0.0.1 shares Windows' loopback with Live. The bridge
-   runs in WSL under systemd and talks to Live over loopback. songml-serve
-   reaches it over TCP. The browser only ever talks to songml-serve. (§2)
+1. **songml-serve moves from the music-tools Coder container to the hive
+   WSL distro on Stablebeast, and the mixroom code lives inside it.**
+   AbletonOSC sends replies to `<sender IP>:11001`, and it sends listener
+   pushes and `/live/test` to **127.0.0.1:11001 only**. So whatever talks
+   to it has to be on Stablebeast's loopback. WSL there runs in
+   **mirrored** networking mode, so a WSL process on 127.0.0.1 shares
+   Windows' loopback with Live. Once songml-serve itself is on that
+   loopback, it can talk UDP to Live directly, and no relay process is
+   needed. The touchscreen URL (`coder-stablehome.ddns.net:8080`) stays
+   the same. The cost is that an internet-facing server moves into the
+   agents' distro, which is why it runs as a dedicated `songml` user that
+   can't read hive credentials. (§2)
 2. **Sync is by polling, and polling happens only while someone is
-   watching.** The bridge re-reads transport state at 4 Hz and the track
-   list plus mute states at 1 Hz, and does both only while a page has
-   asked for state in the last 10 s. It uses no AbletonOSC listeners. That
-   keeps things correct across set loads, AbletonOSC reloads and bridge
-   restarts, which are exactly the cases where listeners go stale. After
-   every command, the bridge re-reads the property it changed before it
-   answers, so the page shows Live's actual state, not what it hoped
-   would happen. (§3)
-3. **The UI is a panel fixed to the bottom of the existing song page.**
-   It has a slim collapsed strip (Play/Stop and the position readout) and
-   an expanded tray (position controls and the mute grid). Touch targets
-   are at least 56 px, and Play/Stop are 72 px. The panel shows up only
-   when songml-serve has both editing (the write token) and `--mix-url`
-   configured, and every `/api/mix/*` call is token-gated, because port
-   8080 is reachable from the internet. (§4)
-4. **Phase 2 (tap a bar to set the position) is designed in now.** The
-   bridge's `locate` takes a position in beats, and phase 1's own
-   bar-step and "to start" buttons already use it. Phase 2 adds only a
-   `data-bar` attribute on the bar cells and a chart-bar → Live-beat map.
-   Neither touches the bridge or the API. (§6)
-5. **Sequencing with #13: build alongside, and land #13 first.** The
-   bridge (slice M1) shares no files with #13. The serve/panel slice (M2)
-   shares only the POST dispatch in `web_server.py`, which is a mechanical
-   rebase. (§7)
-6. **Five decisions for Les, plus one interaction with
-   bert-architecture#14 that he should rule on.** See §9.
+   watching.** The mix layer re-reads transport state at 4 Hz and the
+   track list plus mute states at 1 Hz, and does both only while a page
+   has asked for state in the last 10 s. It uses no AbletonOSC listeners.
+   After every command it re-reads the property it changed before it
+   answers, so the page shows Live's actual state. (§3)
+3. **The UI is a panel fixed to the bottom of the existing song page**,
+   with a slim collapsed strip (Play/Stop, position) and an expanded tray
+   (position controls, mute grid). Touch targets are at least 56 px. The
+   panel shows only when songml-serve has both editing (the write token)
+   and `--mixroom` enabled, and every `/api/mix/*` call is token-gated,
+   because port 8080 is reachable from the internet. (§4)
+4. **Phase 2 (tap a bar to set the position) is designed in now**, and it
+   changes neither the mix layer nor the API. (§6)
+5. **Sequencing with #13: build alongside, land #13 first.** (§7)
+6. **Decisions for Les:** six, listed in §9. Two are new in rev 2: the
+   `songml` user, and retiring the 8080 instance in music-tools.
 
 ---
 
@@ -62,11 +71,22 @@ the rig can answer.
   editing endpoints require `SONGML_WRITE_TOKEN` (503 when it's unset, 403
   on a mismatch). The token is embedded in the song page when editing is
   enabled.
-- On Stablebeast, songml-serve runs inside the **music-tools Coder
-  workspace** container on port 8080. The router forwards that port, so it
-  is **internet-reachable** at `coder-stablehome.ddns.net:8080`. It starts
-  from music-tools' `.myspaces/init` (the installed clone) or from
-  `bin/test-serve.sh` (the dev tree, `uv run`).
+- **Where it runs today.** The production instance runs inside the
+  **music-tools Coder workspace** container on port 8080. music-tools'
+  `.myspaces/init` starts it with `nohup … &` when the workspace starts:
+  it `pip install -e`s the workspace's songml checkout, sources the write
+  token from the gitignored `music-tools/.env`, and serves
+  `/AbletonLive/Sheets`. That's a read-write bind mount of
+  `%USERPROFILE%\Dropbox\AbletonLive`, which only music-tools gets. Docker
+  Desktop publishes 8080 on the Windows host, a port-scoped Windows
+  Firewall rule lets it in, and the router forwards it, so the server is
+  **internet-reachable** at `coder-stablehome.ddns.net:8080`. Nothing
+  restarts it if it dies, short of a workspace restart. In practice
+  there's **no prod/dev split** (songml `CLAUDE.md`):
+  `bin/test-serve.sh bounce` replaces the init-started instance on 8080
+  with `uv run` of the dev tree under hupper `--reload`. So a code edit
+  in music-tools shows up on the touchscreen on the next page load. 8081
+  (`dev_port2`) is also published, for a second disposable instance.
 - The page that matters is the **song page** from `html_exporter.py`: the
   title row with the MIDI and Edit buttons, then CSS-grid strips of bars.
   Bar numbers are plain `.bar-num` divs. The edit overlay is
@@ -89,91 +109,193 @@ the rig can answer.
   `song.tracks`, which means normal and group tracks in arrangement order,
   without returns or master.
 
-## 2. The relay: `songml-mixbridge`
+## 2. Where songml-serve runs, and the mix layer inside it
 
-### 2.1 Where it runs, and why there
+### 2.1 The shape
 
 ```
- piano touchscreen ──HTTP──► songml-serve (music-tools container, :8080)
-                                  │  /api/mix/*  (token-gated, proxied)
-                                  ▼  TCP, docker bridge gateway
-                             songml-mixbridge (WSL on Stablebeast, systemd)
-                                  │  UDP over loopback 127.0.0.1
-                                  ▼        :11000 ►   ◄ :11001
-                             AbletonOSC in mixroom Live (Windows)
+ piano touchscreen ──HTTP :8080──► Windows host (router forward, firewall)
+                                        │  mirrored networking
+                                        ▼
+                     songml-serve  (hive WSL distro, systemd, user `songml`)
+                       ├─ chart pages, editor, /api/save …   (unchanged)
+                       └─ mix layer: /api/mix/* + poll loop
+                                        │  UDP over loopback 127.0.0.1
+                                        ▼        :11000 ►   ◄ :11001
+                     AbletonOSC in mixroom Live (Windows)
 ```
 
-Options I considered:
+The options I weighed:
 
 | option | verdict |
 |---|---|
-| **A. UDP straight from songml-serve in the container** | **Rejected.** The query replies go to `<source IP>:11001`, a fixed port, so the container's NAT has no conntrack entry to route them back. Listener pushes and `/live/test` go to 127.0.0.1, which the container never sees. Making it work would need a template change (publish 11001/udp), and even then pushes would be lost. |
-| **B. A bridge in WSL on Stablebeast (mirrored networking), supervised by systemd** | **Chosen.** Loopback is shared with Windows, so every AbletonOSC reply arrives, pushes included. TCP from the container to the host is ordinary traffic. systemd already supervises long-running services on this box. |
-| C. A bridge as a native Windows Python process | Rejected. Supervision would mean Task Scheduler or a Windows service, there's no dotkit-owned Python on the Windows side, and agents don't run Git Bash over SSH (Les, 2026-11-15). That would make every deploy a Les-at-the-keyboard job. |
-| D. A Max for Live device or a custom remote script instead of AbletonOSC | Out of scope, because the issue fixes AbletonOSC as the engine. |
+| **A. UDP straight from songml-serve in the container** | **Rejected** (as in rev 1). Query replies go to `<source IP>:11001`, a fixed port, so the container's NAT has nothing to route them back by, and pushes go to 127.0.0.1, which the container never sees. |
+| **B. Serve stays in the container; a `songml-mixbridge` process in WSL; serve proxies `/api/mix/*` to it** (rev 1) | **Rejected in rev 2.** It works, but it's two processes, two HTTP APIs, a proxy with its own error mapping, a `--mix-url` to configure in two places, and a container→WSL hop through Docker Desktop's networking that is unproven (see "What changed in rev 2"). Its one advantage is that the internet-facing server stays in a container. §2.4 gets the same isolation more cheaply. |
+| **C. Serve in WSL, bridge still a separate process on 127.0.0.1** | **Rejected.** Once serve is on the loopback, the bridge has nothing left to bridge. Keeping it only keeps the proxy. |
+| **D. Serve in WSL with the mix layer in-process** | **Chosen.** See §2.2 for what gets simpler and §2.3 for what it costs. |
+| E. Serve as a native Windows Python process | Rejected (rev 1's option C). No supervision without Task Scheduler, no dotkit Python on Windows, and agents don't run Git Bash over SSH (Les, 2026-11-15), so every deploy would need Les at the keyboard. |
+| F. Max for Live device or a custom remote script | Out of scope: the issue fixes AbletonOSC as the engine. |
 
-**Which WSL distro is a decision for Les [Les].** Mirrored networking is
-a VM-wide setting, so every distro sees the same loopback, and the choice
-is about ownership and uptime:
+### 2.2 What gets simpler
 
-- **hive** (my recommendation): it's the distro that is kept running
-  24/7 under systemd today (Jenny's units). Its units live in
-  `stablebeast-hive/units` with `units-lint` and the rebuild check. The
-  cost is that one of Les's music tools sits in the agents' distro.
-- **Ubuntu-24.04 (Les's own login)**: this is his user environment, but
-  as far as I know nothing keeps that distro running when he has no
-  session open, so the bridge would die with his last terminal.
+- **One process instead of two.** There's no `songml-mixbridge` console
+  script, no bridge HTTP server, no `--listen` address and no second unit.
+  The mix layer (`songml_utils/mixroom.py`) is an OSC codec, a poll thread
+  and four command functions. `web_server.py` calls them from its
+  `/api/mix/*` routes.
+- **No proxy.** `/api/mix/*` answers from the mix layer's state directly.
+  Rev 1's proxy timeout, "bridge unreachable" 502 mapping and `--mix-url`
+  plumbing through `test-serve.sh` and music-tools' init all go. There's
+  only one failure to report: Live not answering (§3.2).
+- **No container→WSL hop**, which was the least proven link in rev 1.
+- **Supervision.** Today the production server is a `nohup` child of the
+  workspace's init and nothing restarts it. Under systemd it gets
+  `Restart=always` and a journal.
+- **Off-rig development gets easier, not harder.** The M1 fake AbletonOSC
+  is a loopback UDP simulator. With the mix layer in-process, the dev
+  instance and the fake share whatever loopback they run on, including
+  the music-tools container's. So the whole panel can be built and tested
+  in the container with no bridge to stand up (§2.3, dev loop).
 
-### 2.2 What the bridge is
+### 2.3 What it costs
 
-- It's a console script in songml-utils (`songml_utils/mixbridge.py`,
-  entry point `songml-mixbridge`), so the existing **songml kit** puts it
-  on PATH. There's no new kit and no new repo. It's stdlib only: OSC 1.0
-  encoding for the handful of types we need (int, float, string, bool) is
-  about 60 lines, and there's no `python-osc` dependency to add.
-- It owns the UDP socket on **127.0.0.1:11001**, which is AbletonOSC's
-  fixed reply port. **Only one process on Stablebeast can bind it**, so
-  nothing else may use AbletonOSC replies while the bridge runs. If the
-  bind fails, the bridge exits non-zero with a message naming the port and
-  the holder's PID. systemd restarts it, and the journal shows why. It
-  never falls back to a different port.
-- It serves HTTP/JSON on a configured address. The default is the docker
-  bridge gateway, on port 8091 **[default]**. It does *not* bind 0.0.0.0,
-  so nothing on the LAN or Tailscale can reach it. Its only client is
-  songml-serve, and songml-serve does the authentication (§4.4). The
-  listen address is a required flag (`--listen 172.17.0.1:8091`); there's
-  no built-in default address to guess wrong.
+**Dev loop. This is the cost Les will feel most.** Today a code edit in
+music-tools is live on the touchscreen at once, because the one 8080
+instance is the dev tree under `--reload` (§1). After the move, 8080 runs
+the released kit code. To see a change at the piano there are two ways:
 
-### 2.3 Start and supervision
+- *While iterating:* run `bin/test-serve.sh` in music-tools on **8081**
+  (`SONGML_TEST_SERVE_PORT=8081`), against the real Sheets, and open
+  `stablebeast:8081` on the touchscreen over the LAN. It has the same
+  instant reload as today, but it's on a different port and has no mix
+  panel, unless it's pointed at the fake.
+- *To make it live on 8080:* commit, `make release`, then
+  `setup.sh songml` as `songml` plus `systemctl restart songml-serve`
+  (M3 wraps the last two in one command). The
+  hardcoded-clone rule in songml `CLAUDE.md` applies unchanged inside the
+  `songml` user's home.
 
-- It runs as a systemd unit, `songml-mixbridge.service`, with
-  `Restart=always` and `RestartSec=2`. ExecStart is
-  `/bin/bash -i -c 'exec songml-mixbridge --listen …'`, following the
-  dotkit rule for headless callers (`bash -i`, invoked by name, no
-  hard-coded `~/.local/bin` path). If the bridge goes in hive, the unit
-  goes in `stablebeast-hive/units` and has to pass `units-lint`. If it
-  goes in Les's distro, it's a user unit that the songml kit installs
-  through a second-stage `songml-mixbridge install-unit` (install logic
-  lives in the kit, per DOTKIT_GUIDE, "Where Kits Live").
-- It runs always, because it costs almost nothing when idle: it polls Live
-  only while it's being watched (§3.1). When Live isn't running or
-  AbletonOSC isn't loaded, the bridge stays up and reports
-  `live: "unreachable"`, and the panel says so in words.
-- **songml-serve learns the bridge URL from a new flag,
-  `--mix-url http://172.17.0.1:8091`.** `bin/test-serve.sh` passes it
-  through from `SONGML_MIX_URL`, and music-tools' `.myspaces/init` sets it
-  for the installed instance. That's a one-line change in Les's repo. With
-  the flag absent, mixroom control simply isn't enabled on that server:
-  there's no panel, which is the same convention as editing without a
-  token. With the flag set but the bridge down, the panel shows a red
-  **"mixroom bridge unreachable: <url>: <error>"**. It never fails
-  silently.
+Mix work off the rig runs in music-tools with `--mixroom` pointed at the
+fake on the container's loopback. Testing against **real Live** has to
+happen in WSL, because that's where the loopback is: a WSL clone,
+`uv run songml-serve --mixroom …` as `songml`, after
+`systemctl stop songml-serve` (11001 has a single owner, §2.5). That's a
+handful of sessions during M2, not the everyday loop.
+
+If that split bothers Les more than the bridge does, rev 1 (option B) is
+still the answer that keeps today's loop. The rest of this design works
+with either. That's decision 1 in §9.
+
+**Deploy.** Today, deploying means restarting the workspace, which
+re-runs `pip install -e` on the checkout. After the move it's a songml
+kit update in the `songml` user's dotkit, then
+`systemctl restart songml-serve`. It's one more explicit step, but it's
+the paved path: the unit lives in `stablebeast-hive/units`, passes
+`units-lint`, and runs
+`/bin/bash -i -c 'exec songml-serve --port 8080 --root … --mixroom'`
+(dotkit rule for headless callers: `bash -i`, invoked by name, no
+hard-coded `~/.local/bin` path). The songml kit installer has to
+guarantee songml-serve's Python dependencies in that environment. If it
+doesn't today, that gets fixed in the kit, not in the unit.
+
+**Where the sheet files live.** Nowhere new. They stay in
+`%USERPROFILE%\Dropbox\AbletonLive\Sheets` on Windows, which is the same
+files Dropbox syncs. The container sees them through Docker Desktop's
+bind mount, and WSL sees them through drvfs. Both are 9p mounts of the
+same Windows folder, so read latency and Dropbox's view of a save are the
+same. One detail: the default `/mnt/c` automount gives write access only
+to uid 1000 (the `hive` user), so the `songml` user gets its own drvfs
+mount of just the AbletonLive folder in `/etc/fstab`, owned by `songml`,
+at `/srv/AbletonLive` **[default]**. The music-tools mount stays as it
+is, so dev and Les's own work there are unaffected. Spike row 6 proves a
+save from WSL reaches Dropbox.
+
+**How the touchscreen reaches it.** Same URL. With mirrored networking, a
+WSL process bound to `0.0.0.0:8080` listens on Stablebeast's own
+addresses, so the router forward and the existing port-scoped Windows
+Firewall rule for 8080 carry over. Two changes go with it:
+
+- Docker Desktop must stop publishing 8080, or the two collide. That
+  means music-tools `dev_port=8080` → `0` in `coder-templates`'
+  `workspaces.conf`, reprovisioning music-tools, and dropping the
+  songml-serve start from music-tools' `.myspaces/init` (Les's repo). 8081
+  stays for the dev instance. **[Les]**, because it retires the
+  instance Les uses today.
+- WSL's Hyper-V firewall may block inbound connections to WSL even when
+  the Windows rule allows the port. If it does, a one-time
+  `New-NetFirewallHyperVRule` for TCP 8080 is needed, and that's
+  Les-at-the-keyboard work. **[spike]**, row 4.
+
+**Write token.** It moves from `music-tools/.env` to
+`~songml/.config/songml/serve.env` (mode 600), read by the unit's
+`EnvironmentFile=`. Les copies it there once at M3. The same value works,
+so the touchscreen's open pages and bookmarks are unaffected.
+
+**Security.** This is the real cost. Port 8080 is internet-facing, and
+the server moves from a throwaway container into the distro where the
+hive's agents and their credentials live (gh tokens, pipe keys,
+bert-helpers state). §2.4 deals with it.
+
+**Kit install for `songml`.** The songml kit's `setup.sh` clones into a
+fixed `~/workarea/songml` and `pip install -e --user`s it, so under the
+`songml` user that's `~songml/workarea/songml`, with no kit change. M3
+checks that the kit installer brings everything songml-serve needs on a
+fresh user. Anything missing gets fixed in the kit.
+
+### 2.4 The `songml` user [Les]
+
+songml-serve runs as a dedicated system user, `songml`, in the hive
+distro, with its own home, its own dotkit and the songml kit installed
+the normal way, and `User=songml` in the unit. Hive credentials are under
+`/home/hive` and other agents' homes, mode 700, so a compromised
+songml-serve can't read them. The unit adds `NoNewPrivileges=yes`,
+`ProtectSystem=strict`, `ReadWritePaths=/srv/AbletonLive/Sheets` and
+`PrivateTmp=yes` **[default]**. Spike row 7 checks the isolation: from a
+shell as `songml`, `cat /home/hive/.config/gh/hosts.yml` fails.
+
+Two things it doesn't cover, stated so nobody assumes otherwise. The
+default `/mnt/c` automount leaves the whole Windows drive readable by
+every WSL user (umask 022). That's no worse than today, since the
+container already sees all of `%USERPROFILE%` read-only as `/host_home`.
+Tightening the automount would affect every hive tool that reads
+`/mnt/c`, so it's out of scope here. And the `songml` user can talk to
+AbletonOSC, which is the point.
+
+Options I rejected:
+
+- **Run as `hive`.** Simplest, but then an internet-facing bug reads
+  every hive credential.
+- **Les's Ubuntu-24.04 distro, as Les.** It's his environment, but his
+  credentials are there too, and nothing keeps that distro running when he
+  has no session open (rev 1 §2.1).
+- **Keep it in a container.** That's option B, which brings back the
+  proxy and the unproven hop.
+
+### 2.5 The mix layer
+
+- `songml_utils/mixroom.py`, stdlib only. OSC 1.0 encoding for the few
+  types needed (int, float, string, bool) is about 60 lines, so there's no
+  `python-osc` dependency.
+- It's enabled by `--mixroom` on songml-serve **[default]**. With the flag
+  absent, the server neither binds 11001 nor shows the panel, which is
+  the same convention as editing without a token. Only the production
+  instance sets it. The dev instance sets it only when pointed at the
+  fake.
+- It owns the UDP socket on **127.0.0.1:11001**, AbletonOSC's fixed reply
+  port. **Only one process on Stablebeast can bind it.** If the bind
+  fails, songml-serve exits non-zero at startup with a message naming the
+  port and the holder's PID. systemd restarts it and the journal shows
+  why. It never falls back to another port, and it never starts without
+  the mix layer when `--mixroom` was asked for.
+- When Live isn't running or AbletonOSC isn't loaded, the server stays up
+  and reports `live: "unreachable"`, and the panel says so in words.
 
 ## 3. Reading state back and keeping it in sync
 
 ### 3.1 Polling, not listeners [default]
 
-While watched, meaning any `GET /state` in the last 10 s, the bridge:
+While watched, meaning any `GET /api/mix/state` in the last 10 s, the mix
+layer:
 
 - **every 250 ms** sends `get/is_playing`, `get/current_song_time`,
   `get/tempo`, `get/signature_numerator` and `get/signature_denominator`;
@@ -182,16 +304,16 @@ While watched, meaning any `GET /state` in the last 10 s, the bridge:
   track.is_foldable track.color`, which returns the whole mute array in
   one reply.
 
-Each reply updates a per-address slot with a timestamp. The bridge is the
-only client on 11001 and keeps at most one query per address in flight,
-so a reply's OSC address is enough to match it to its query. No request
-IDs are needed.
+Each reply updates a per-address slot with a timestamp. The mix layer is
+the only client on 11001 and keeps at most one query per address in
+flight, so a reply's OSC address is enough to match it to its query. No
+request IDs are needed.
 
 **Why not AbletonOSC listeners?** Listeners would give sub-tick latency
-for changes Les makes by hand in Live, but they bring a lifecycle the
-bridge would have to get right every time. AbletonOSC drops all listeners
+for changes Les makes by hand in Live, but they bring a lifecycle the mix
+layer would have to get right every time. AbletonOSC drops all listeners
 on `/live/api/reload` and when the control surface is re-instantiated (a
-set load). Listeners a crashed bridge left behind keep firing at 11001.
+set load). Listeners a crashed server left behind keep firing at 11001.
 And there's no listener at all for "tracks were added or removed", so
 we'd have to poll for that anyway. Polling handles every one of these
 cases the same way. On loopback the cost is about 10 small datagrams a
@@ -201,8 +323,8 @@ fast enough for this job.
 
 ### 3.2 Freshness and the "unreachable" state
 
-- `GET /state` returns the latest values together with `age_ms` for each
-  group. If no transport reply has arrived for 1.5 s, the bridge reports
+- `GET /api/mix/state` returns the latest values together with `age_ms`
+  for each group. If no transport reply has arrived for 1.5 s, it reports
   `live: "unreachable"` and the panel greys every control, with the reason
   showing ("mixroom Live not answering: is Live open with AbletonOSC
   selected as a control surface?").
@@ -215,12 +337,12 @@ fast enough for this job.
 Every command re-reads what it changed before it answers, and the
 response carries the resulting state:
 
-| bridge endpoint | what it sends | guard (refusal → HTTP 409 with reason) | re-read before reply |
+| endpoint | what it sends | guard (refusal → HTTP 409 with reason) | re-read before reply |
 |---|---|---|---|
-| `POST /play` | `start_playing` **or** `continue_playing`, per spike row 3 | refused if a fresh `is_playing` read is true: **never retrigger while playing** (Les's rule, 2026-10-31) | `is_playing` |
-| `POST /stop` | `stop_playing` | refused if already stopped, so the API never issues Live's second-stop "return to start" by accident | `is_playing`, `current_song_time` |
-| `POST /locate {beat}` | `set/current_song_time beat` | refused while playing (position is set while stopped); `beat ≥ 0` | `current_song_time` |
-| `POST /mute {index, name, mute}` | `track/set/mute index 0/1` | refused if the track at `index` no longer has `name` (the page is stale after a set change) | that track's `mute` |
+| `POST /api/mix/play` | `start_playing` **or** `continue_playing`, per spike row 3 | refused if a fresh `is_playing` read is true: **never retrigger while playing** (Les's rule, 2026-10-31) | `is_playing` |
+| `POST /api/mix/stop` | `stop_playing` | refused if already stopped, so the API never issues Live's second-stop "return to start" by accident | `is_playing`, `current_song_time` |
+| `POST /api/mix/locate {beat}` | `set/current_song_time beat` | refused while playing (position is set while stopped); `beat ≥ 0` | `current_song_time` |
+| `POST /api/mix/mute {index, name, mute}` | `track/set/mute index 0/1` | refused if the track at `index` no longer has `name` (the page is stale after a set change) | that track's `mute` |
 
 The re-read waits up to 400 ms, about 3 Live ticks. If it times out, the
 command answers `ok: false, error: "no confirmation from Live"`, and the
@@ -293,36 +415,33 @@ The page polls `GET /api/mix/state` at 4 Hz while expanded and at 1 Hz
 while collapsed, and stops while the tab is hidden
 (`visibilitychange`). Between polls the position readout doesn't dead
 reckon in phase 1: a 250 ms granularity at bar.beat resolution is fine.
-I rejected SSE for phase 1 because it means proxying a long-lived stream
-through songml-serve's thread-per-request server and a reconnect path for
-a 4 Hz number. If phase 2 wants a smooth playhead, SSE (or dead reckoning
-from `tempo` + `age_ms`) can be added then without changing the bridge's
-API.
+I rejected SSE for phase 1: it means a long-lived stream on
+songml-serve's thread-per-request server and a reconnect path, all for a
+4 Hz number. If phase 2 wants a smooth playhead, SSE (or dead reckoning
+from `tempo` + `age_ms`) can be added then without changing the mix
+layer.
 
-### 4.4 songml-serve endpoints (proxy only)
+### 4.4 songml-serve endpoints
 
 `GET /api/mix/state?token=…`, `POST /api/mix/{play,stop,locate,mute}` with
 `token` in the JSON body, which is the same shape and the same
 `_check_token` as `/api/save`. Every `/api/mix/*` call is token-gated,
 reads included, because port 8080 is internet-reachable and the state
-includes the mix set's track names. songml-serve forwards to `--mix-url`
-with a 1 s timeout, passes the bridge's JSON and status code through, and
-maps connection errors to `502 {"ok":false,"error":"mixroom bridge
-unreachable: …"}`. songml-serve holds no mix state of its own.
+includes the mix set's track names. Without `--mixroom` the routes answer
+404 and the page has no panel.
 
 ## 5. Security
 
 - **AbletonOSC listens on 0.0.0.0:11000 with no authentication.** If
   Live.exe has a broad Windows Firewall allow rule, as it usually does
   after the first-run prompt, anyone on the LAN or the tailnet can drive
-  the mixroom Live. Since the bridge uses loopback only, **blocking inbound
-  UDP 11000 on Stablebeast from everything except loopback costs nothing
-  [Les]**. Spike row 5 proves that the rule works and that the bridge
-  still does.
-- The bridge binds the docker bridge gateway, not 0.0.0.0, so it isn't on
-  the LAN either.
-- The only internet-facing surface is songml-serve's `/api/mix/*`, gated
-  by the existing write token.
+  the mixroom Live. Since songml-serve uses loopback only, **blocking
+  inbound UDP 11000 on Stablebeast from everything except loopback costs
+  nothing [Les]**. Spike row 5 proves that the rule works and that
+  loopback still does.
+- The only internet-facing surface is songml-serve, as today. Its
+  `/api/mix/*` routes are gated by the existing write token, and the
+  process runs as the `songml` user (§2.4).
 
 ## 6. Phase 2: tap a bar to set the position (not built now; not blocked)
 
@@ -333,44 +452,53 @@ Phase 2 needs:
 2. A chart-bar → Live-beat map: `beat = (chart_bar + LB1 − 2) ×
   bar_len`, where `LB1` is the Live bar on which chart bar 1 falls in the
   mixroom set. That's the `Live-Bar-1:` property from
-  bert-architecture#14 §5.2, default 1. `bar_len` comes from the bridge's
-  meter.
+  bert-architecture#14 §5.2, default 1. `bar_len` comes from the meter in
+  state.
 3. A tap handler that calls the existing `POST /api/mix/locate` and is
   inert while playing (the same guard as phase 1's position buttons).
 
 Phase 1 already provides `locate {beat}`, the stopped-only guard, the
-meter in state, and the position readout. Phase 2 changes no bridge code
-and no API. The one thing phase 1 must avoid is putting chart-bar
-arithmetic into the bridge, and this design keeps the bridge in Live beats
+meter in state, and the position readout. Phase 2 changes no mix-layer
+code and no API. The one thing phase 1 must avoid is putting chart-bar
+arithmetic into the mix layer, and this design keeps it in Live beats
 throughout.
 
 ## 7. Slices and sequencing
 
 | slice | content | tested by | depends |
 |---|---|---|---|
-| **M0 spike** (~30 min, mixroom Live open, Les's OK to touch it) | probe script from WSL (`tools/spike/mixosc.py`, deleted after) | rows below | — |
-| **M1 bridge** | `mixbridge.py` (OSC codec, poll loop, watched-window, HTTP API, guards, read-after-write), console script, **fake AbletonOSC** (loopback UDP sim of the calls in §1, scripted state) | pytest against the fake: every guard and refusal, stale-index mute, unreachable after 1.5 s, `tracks_rev` bump on set change, confirmation timeout | M0 rows 1–3 |
-| **M2 serve + panel** | `--mix-url`, `/api/mix/*` proxy (token-gated), the panel in `html_exporter` (CSS/JS beside `_EDIT_CSS`/`_EDIT_JS`), `test-serve.sh` passes `SONGML_MIX_URL` | pytest: proxy, token, 502 mapping, no panel without `--mix-url`/token; browser against M1 + fake; at the rig: Les mutes and plays from the piano | M1 |
-| **M3 deploy** | systemd unit (hive: stablebeast-hive PR; Les's distro: kit `install-unit`), music-tools `.myspaces/init` sets `SONGML_MIX_URL`, firewall rule (§5) | M0 rows 4–5 re-run against the deployed unit | M2, §9 decisions |
+| **M0 spike** (~45 min, mixroom Live open, Les's OK to touch it) | probe script from WSL (`tools/spike/mixosc.py`, deleted after) plus a throwaway listener on 8080 | rows below | — |
+| **M1 mix layer** | `mixroom.py` (OSC codec, poll loop, watched-window, guards, read-after-write) and a **fake AbletonOSC** (loopback UDP sim of the calls in §1, scripted state) | pytest against the fake: every guard and refusal, stale-index mute, unreachable after 1.5 s, `tracks_rev` bump on set change, confirmation timeout, loud exit when 11001 is taken | M0 rows 1–3 |
+| **M2 serve + panel** | `--mixroom`, the `/api/mix/*` routes (token-gated), the panel in `html_exporter` (CSS/JS beside `_EDIT_CSS`/`_EDIT_JS`) | pytest: routes, token, 404 without `--mixroom`, no panel without token; browser in music-tools against the fake; at the rig (WSL, §2.3): Les mutes and plays from the piano | M1 |
+| **M3 move + deploy** | `songml` user with dotkit + songml kit; fstab drvfs mount (§2.3); unit in `stablebeast-hive/units`; token file; Hyper-V rule if row 4 needs it; firewall rule (§5); `coder-templates` music-tools `dev_port=0` + reprovision; music-tools init stops starting serve | M0 rows 4–7 re-run against the deployed unit; the touchscreen opens a chart and saves an edit | M2, §9 decisions |
 | *phase 2* | §6 | — | M2 |
+
+M3's pieces land in four repos (songml kit in `local.bin` if it needs
+changes, `stablebeast-hive`, `coder-templates`, `music-tools`). The
+cut-over order is: unit installed but stopped → music-tools stops
+publishing 8080 → unit started → touchscreen check. The touchscreen is
+down for about as long as the reprovision takes.
 
 **Spike M0 rows**
 
 | # | test | pass |
 |---|---|---|
-| 1 | From WSL: `/live/test` → 127.0.0.1:11000 | `"ok"` arrives on 127.0.0.1:11001 in WSL (proves AbletonOSC is loaded and mirrored loopback carries UDP both ways) |
+| 1 | From WSL: `/live/test` → 127.0.0.1:11000 | `"ok"` arrives on 127.0.0.1:11001 in WSL (AbletonOSC is loaded and mirrored loopback carries UDP both ways) |
 | 2 | `get/track_data 0 N track.name track.mute track.is_grouped track.color`; set mute on one throwaway track and clear it again | names and mutes match Live's UI; the UI follows the set |
-| 3 | Stopped. `set/current_song_time` to bar 9, then `start_playing`; stop; repeat with `continue_playing` | which one starts at the located position. The bridge uses that one, and only that one (no try-A-then-B) |
-| 4 | From the music-tools container: `curl` a test listener on the docker bridge gateway in the chosen distro | reachable. If the workspace uses a non-default network, record its gateway; that becomes the `--listen`/`--mix-url` address |
-| 5 | After the firewall rule (§5): `/live/test` from another LAN host | no reply, while row 1 still passes |
+| 3 | Stopped. `set/current_song_time` to bar 9, then `start_playing`; stop; repeat with `continue_playing` | which one starts at the located position. The mix layer uses that one, and only that one (no try-A-then-B) |
+| 4 | music-tools stopped (or a spare port, e.g. 8092, if Les won't stop it yet): a throwaway listener in WSL on `0.0.0.0:<port>`; fetch it from the touchscreen, from a LAN host and from outside via the ddns name | reachable all three ways. If not, record whether the Hyper-V firewall is what blocks it; that sets M3's Les step |
+| 5 | After the UDP 11000 rule (§5): `/live/test` from another LAN host | no reply, while row 1 still passes |
+| 6 | As `songml`, through the fstab mount: write a scratch `.songml` file under Sheets, then delete it | it appears in Windows Explorer and Dropbox syncs it |
+| 7 | As `songml`: read `/home/hive/.config/gh/hosts.yml` | permission denied |
 
 **Sequencing with #13: alongside, with #13 landing first [default].**
 M0 and M1 share no files with #13. M2 and #13 both touch
 `web_server.py`'s `do_POST` dispatch, and #13 also touches the index page,
 which M2 doesn't. If both are in flight, #13 lands first and M2 rebases,
-which is a mechanical change to the route table. I'd rather not serialize:
-#13 needs no rig time, M0 does, and the two shouldn't wait on each other.
-Neither needs the other's features.
+which is a mechanical change to the route table. #13 needs no rig time and
+M0 does, so the two shouldn't wait on each other. The move (M3) doesn't
+affect #13: #13 serves the same Sheets folder from wherever the server
+runs.
 
 ## 8. Relation to bert-architecture#14 (two-Live verified start)
 
@@ -383,25 +511,34 @@ the two overlap:
 - This design is **single-Live** (mixroom only) and does not implement
   #14's readiness gate. A panel Play starts the mixroom, and Link takes it
   from there, the same as the spacebar.
-- §5's loopback-only bridge and firewall rule answer #14's security
+- §5's loopback-only use and firewall rule answer #14's security
   objection to AbletonOSC as far as the mixroom goes.
 - **[Les]** whether #14 is parked, or whether its two-Live gate later
-  builds on this bridge (adding a studio-side bridge) instead of on
-  `SongMLTx`. Phase 1 here doesn't depend on the answer, and I'd park #14
-  until phase 1 has been used at the piano.
+  builds on this mix layer instead of on `SongMLTx`. Phase 1 here doesn't
+  depend on the answer, and I'd park #14 until phase 1 has been used at
+  the piano.
 
 ## 9. Decisions for Les
 
-1. **Bridge host:** hive distro (recommended) or your Ubuntu-24.04 distro.
-2. **Firewall:** block inbound UDP 11000 on Stablebeast except loopback
+1. **Where songml-serve runs:** the hive WSL distro, with the mix layer
+   in-process (recommended, §2), or rev 1's container plus bridge. The
+   trade: one process, no proxy and no unproven Docker hop, against
+   losing "edit in music-tools, live on 8080 at once" (it moves to 8081
+   on the LAN; 8080 runs releases; §2.3).
+2. **The `songml` user** in the hive distro, with its own dotkit
+   (recommended, §2.4), or run it as `hive`.
+3. **Retire the 8080 instance in music-tools** at M3 cut-over:
+   `dev_port=0`, init stops starting serve, and 8081 stays for dev
+   (recommended; it follows from 1).
+4. **Firewall:** block inbound UDP 11000 on Stablebeast except loopback
    (recommended: yes).
-3. **Collapsed panel:** slim strip with Play/Stop/position (recommended),
-   or fully hidden.
-4. **Mute grid:** every track in Live order (recommended), or a filtered
-   list (say how: names, colour, group).
-5. **bert-architecture#14:** park it until phase 1 is in use (recommended),
-   or keep it moving.
+5. **Panel and grid:** slim collapsed strip (recommended) or fully hidden;
+   every track in Live order (recommended) or a filter you describe.
+6. **bert-architecture#14:** park it until phase 1 is in use
+   (recommended), or keep it moving.
 
 Engineering choices that stand unless someone objects: polling, not
-listeners (§3.1); page polling, not SSE (§4.3); stdlib OSC codec (§2.2);
-#13 lands first (§7); touch sizes (§4.1).
+listeners (§3.1); page polling, not SSE (§4.3); stdlib OSC codec (§2.5);
+`--mixroom` flag and loud exit on a taken 11001 (§2.5); `/srv/AbletonLive`
+mount and unit hardening (§2.3, §2.4); #13 lands first (§7); touch sizes
+(§4.1).
