@@ -450,6 +450,15 @@ reads included, because port 8080 is internet-reachable and the state
 includes the mix set's track names. Without `--mixroom` the routes answer
 404 and the page has no panel.
 
+As built in M2: a command answers `{ok, status, error, state}`, where
+`state` is always the re-read state, whatever the outcome. The HTTP status
+follows `status`: `ok` 200, `refused` 409, `unconfirmed` 504 ("no
+confirmation from Live"), `unreachable` 502. `GET /api/mix/state` answers
+`{ok: true, state}`. `--mixroom` without `SONGML_WRITE_TOKEN` is a startup
+error, not a server without a panel: the flag asks for something the server
+couldn't deliver. songml-serve turns SIGTERM (systemd's stop) into a clean
+exit, so the mix layer drains in-flight replies before it releases 11001.
+
 ## 5. Security
 
 - **AbletonOSC listens on 0.0.0.0:11000 with no authentication.** If

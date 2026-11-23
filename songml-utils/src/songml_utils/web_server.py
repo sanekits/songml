@@ -20,6 +20,7 @@ from .chord_voicings import DEFAULT_VOICINGS_PATH, find_local_voicings_path
 from .formatter import cleanup_songml
 from .html_exporter import _CSS, to_html_string
 from .midi_exporter import export_midi
+from .mixroom import CommandResult, MixLayer
 from .parser import ParseError, parse_songml
 
 _INDEX_CSS = (
@@ -34,12 +35,19 @@ li{margin:.4rem 0;font-size:1rem}
 
 
 _MAX_SAVE_BYTES = 1_000_000  # max POST /api/save body
+_MAX_MIX_BYTES = 4096  # max POST /api/mix/* body
+
+# HTTP status for each mix command outcome (design §3.3, §4.2). Every response carries
+# the re-read state, so the page shows what Live reports whatever the outcome.
+_MIX_STATUS_HTTP = {"ok": 200, "refused": 409, "unconfirmed": 504, "unreachable": 502}
+_MIX_COMMANDS = ("play", "stop", "locate", "mute")
 
 
 class _Handler(BaseHTTPRequestHandler):
     root: Path
     bars_per_row: int
     write_token: str | None = None
+    mix: MixLayer | None = None
 
     def log_message(self, format, *args):  # noqa: A002
         sys.stderr.write(f"[{self.log_date_time_string()}] {format % args}\n")
@@ -50,6 +58,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_index()
         elif path == "/api/source":
             self._serve_source()
+        elif path == "/api/mix/state":
+            self._serve_mix_state()
         elif path.startswith("/song/"):
             self._serve_song(path[len("/song/") :])
         elif path.startswith("/midi/"):
@@ -66,6 +76,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_save()
         elif path == "/api/format":
             self._handle_format()
+        elif path.startswith("/api/mix/") and path[len("/api/mix/") :] in _MIX_COMMANDS:
+            self._handle_mix_command(path[len("/api/mix/") :])
         else:
             self._send(404, "text/plain", b"Not found")
 
@@ -106,6 +118,7 @@ class _Handler(BaseHTTPRequestHandler):
                 editable=bool(self.__class__.write_token),
                 write_token=self.__class__.write_token,
                 song_path=rel_path,
+                mixroom=self.__class__.mix is not None,
             )
             self._send(200, "text/html; charset=utf-8", rendered.encode())
         except ParseError as e:
@@ -211,15 +224,14 @@ class _Handler(BaseHTTPRequestHandler):
         body = json.dumps({"ok": True, "path": target.name, "content": content}).encode("utf-8")
         self._send(200, "application/json", body)
 
-    def _read_edit_payload(self) -> tuple[dict, str] | None:
-        # Read a JSON body for the editing POST endpoints, check its token, and
-        # require a string "content". Returns (payload, content), or sends the
-        # error response and returns None.
+    def _read_json_payload(self, max_bytes: int) -> dict | None:
+        # Read a JSON object body and check its token. Returns the payload, or
+        # sends the error response and returns None.
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
-        if length <= 0 or length > _MAX_SAVE_BYTES:
+        if length <= 0 or length > max_bytes:
             self._send(413, "application/json", b'{"ok":false,"error":"body too large or empty"}')
             return None
         try:
@@ -231,6 +243,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(400, "application/json", b'{"ok":false,"error":"invalid JSON body"}')
             return None
         if not self._check_token(payload.get("token")):
+            return None
+        return payload
+
+    def _read_edit_payload(self) -> tuple[dict, str] | None:
+        # Read a JSON body for the editing POST endpoints, check its token, and
+        # require a string "content". Returns (payload, content), or sends the
+        # error response and returns None.
+        payload = self._read_json_payload(_MAX_SAVE_BYTES)
+        if payload is None:
             return None
         content = payload.get("content")
         if not isinstance(content, str):
@@ -294,6 +315,56 @@ class _Handler(BaseHTTPRequestHandler):
         )
         self._send(200, "application/json", body)
 
+    def _mix_or_404(self) -> MixLayer | None:
+        # Without --mixroom the mix routes don't exist (design §4.4).
+        mix = self.__class__.mix
+        if mix is None:
+            self._send(404, "text/plain", b"Not found")
+        return mix
+
+    def _send_json(self, code: int, obj: dict) -> None:
+        self._send(code, "application/json", json.dumps(obj).encode("utf-8"))
+
+    def _serve_mix_state(self):
+        # GET /api/mix/state?token=<token> -> {"ok": true, "state": {...}}. Token-gated
+        # like every /api/mix/* call: 8080 is internet-facing and the state names the
+        # mix set's tracks. Counts as a watch, so it keeps the mix layer polling.
+        mix = self._mix_or_404()
+        if mix is None:
+            return
+        query = parse_qs(urlparse(self.path).query)
+        if not self._check_token(query.get("token", [None])[0]):
+            return
+        self._send_json(200, {"ok": True, "state": mix.state()})
+
+    def _handle_mix_command(self, command: str):
+        # POST /api/mix/{play,stop,locate,mute} with "token" in the JSON body.
+        # -> {"ok", "status", "error", "state"}; HTTP status from _MIX_STATUS_HTTP.
+        mix = self._mix_or_404()
+        if mix is None:
+            return
+        payload = self._read_json_payload(_MAX_MIX_BYTES)
+        if payload is None:
+            return
+        result: CommandResult
+        if command == "play":
+            result = mix.play()
+        elif command == "stop":
+            result = mix.stop()
+        elif command == "locate":
+            result = mix.locate(payload.get("beat"))
+        else:
+            result = mix.mute(payload.get("index"), payload.get("name"), payload.get("mute"))
+        self._send_json(
+            _MIX_STATUS_HTTP[result.status],
+            {
+                "ok": result.ok,
+                "status": result.status,
+                "error": result.reason,
+                "state": result.state,
+            },
+        )
+
     def _send(self, code: int, content_type: str, body: bytes):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
@@ -303,14 +374,26 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
 
-def _make_handler(root: Path, bars_per_row: int, write_token: str | None = None) -> type[_Handler]:
+def _make_handler(
+    root: Path,
+    bars_per_row: int,
+    write_token: str | None = None,
+    mix: MixLayer | None = None,
+) -> type[_Handler]:
     class Handler(_Handler):
         pass
 
     Handler.root = root
     Handler.bars_per_row = bars_per_row
     Handler.write_token = write_token
+    Handler.mix = mix
     return Handler
+
+
+def _raise_system_exit(signum, frame):
+    # systemd stops the unit with SIGTERM. Turn it into SystemExit so main's finally
+    # runs and the mix layer drains in-flight replies before releasing 11001 (§2.5).
+    raise SystemExit(0)
 
 
 def _pids_listening_on_port(port: int) -> set[int]:
@@ -424,6 +507,14 @@ def main() -> int:
         action="store_true",
         help="If --port is already in use, kill whatever is listening on it and take it over",
     )
+    parser.add_argument(
+        "--mixroom",
+        action="store_true",
+        help=(
+            "Enable the mixroom transport/mute panel: drive AbletonOSC on 127.0.0.1:11000 "
+            "and hold its reply port 127.0.0.1:11001. Requires SONGML_WRITE_TOKEN"
+        ),
+    )
     args = parser.parse_args()
 
     if args.reload:
@@ -437,7 +528,16 @@ def main() -> int:
         return 1
 
     write_token = os.environ.get("SONGML_WRITE_TOKEN") or None
-    handler = _make_handler(root, args.bars_per_row, write_token)
+    if args.mixroom and not write_token:
+        # Every /api/mix/* call is token-gated (design §4.4): without a token the
+        # panel could never work, so asking for it is an error, not a quiet no-op.
+        print(
+            "Error: --mixroom needs SONGML_WRITE_TOKEN set (the mix routes are token-gated)",
+            file=sys.stderr,
+        )
+        return 1
+    mix = MixLayer() if args.mixroom else None
+    handler = _make_handler(root, args.bars_per_row, write_token, mix)
     try:
         server = ThreadingHTTPServer(("0.0.0.0", args.port), handler)
     except OSError as e:
@@ -462,11 +562,29 @@ def main() -> int:
             )
             return 1
 
+    if mix is not None:
+        signal.signal(signal.SIGTERM, _raise_system_exit)
+        try:
+            # Raises MixroomPortTaken (a SystemExit naming port and holder) if 11001
+            # is held: songml-serve never runs without the mix layer it was asked for.
+            mix.start()
+        except BaseException:
+            server.server_close()
+            raise
+
     print(f"SongML server:  http://localhost:{args.port}/")
     print(f"Serving files:  {root}")
     print(
         "Editing:        "
         + ("enabled" if write_token else "disabled (set SONGML_WRITE_TOKEN to enable)")
+    )
+    print(
+        "Mixroom:        "
+        + (
+            f"enabled (AbletonOSC {mix.live[0]}:{mix.live[1]}, replies on :{mix.bind[1]})"
+            if mix is not None
+            else "disabled (--mixroom to enable)"
+        )
     )
     print("Press Ctrl+C to stop.")
     try:
@@ -475,6 +593,8 @@ def main() -> int:
         print("\nShutting down.")
     finally:
         server.server_close()
+        if mix is not None:
+            mix.close()
     return 0
 
 

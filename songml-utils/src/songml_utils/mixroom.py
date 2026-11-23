@@ -2,7 +2,7 @@
 
 Design: ``docs/mixroom-transport-design.md`` (sanekits/songml#14, #15). This module is the
 M1 slice: the OSC client, the poll loop, the watched window, the command guards and the
-read-after-write checks. M2 wires it into ``songml-serve --mixroom`` as ``/api/mix/*``.
+read-after-write checks. ``songml-serve --mixroom`` (M2) serves it as ``/api/mix/*``.
 
 Shape:
 
@@ -514,7 +514,8 @@ class MixLayer:
         got = self._query(TRACK_MUTE, [index])
         if got is None:
             return self._unconfirmed()
-        if got != [index, mute]:
+        # Normalize: AbletonOSC may answer the mute as int 0/1 rather than T/F.
+        if len(got) != 2 or got[0] != index or bool(got[1]) != mute:
             return self._unconfirmed(f"track {index} mute reads {got[-1]}")
         return self._result("ok")
 
