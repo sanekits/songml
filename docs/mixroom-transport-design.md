@@ -116,9 +116,23 @@ replaced by "the mix layer". Les's "generally sounds good" covers them.
   stop position. A set while *playing* moves the playhead. So Play is
   **play-then-locate**: `continue_playing` followed at once by
   `set/current_song_time <the stopped position>`, in one burst (§3.3).
-  `start_playing` is not used. The cost is a few milliseconds of audio
-  from the last stop position before the jump; if that's audible at the
-  rig in M2, M2 mutes the master for the burst.
+  `start_playing` is not used.
+- **The play burst needs retries and a mute** (M2 rig session,
+  2026-11-22, #14). AbletonOSC applies messages on Live's own update
+  tick (about 100 ms). A locate sent with `continue_playing` can land
+  before the transport runs, and Live drops it like a stopped locate, so
+  Play re-sends the locate until Live reads back playing at the target
+  (6 tries, 50 ms apart). Meanwhile Live plays about one tick from the
+  last stop position: at the rig that was a loud burst, not a few
+  milliseconds. AbletonOSC can't reach the master track, so Play mutes
+  every unmuted track in `song.tracks` before `continue_playing`, holds
+  the mutes 50 ms after the position confirms, then unmutes exactly
+  those tracks and confirms that too. Les's own mutes are never touched.
+  On screen, Live's playhead still flicks to the last stop position and
+  back. That's cosmetic, and Les accepted it on the rig. Hiding it would
+  mean running the burst on every locate instead. Stop and locate also
+  re-read (without re-sending) for up to 6 × 50 ms, because a read in the
+  same tick as the command returns the old value.
 - **11001 stays bound for the mix layer's whole life** (found in M0 row 1,
   #14). On Windows, a reply AbletonOSC sends to an unheld 11001 comes back
   as ICMP port-unreachable and kills its receive loop
@@ -359,7 +373,7 @@ response carries the resulting state:
 
 | endpoint | what it sends | guard (refusal → HTTP 409 with reason) | re-read before reply |
 |---|---|---|---|
-| `POST /api/mix/play` | **play-then-locate** (M0 row 3, §1): reads the stopped `current_song_time` (the position the panel shows), then `continue_playing` + `set/current_song_time <that position>` in one burst | refused if a fresh `is_playing` read is true: **never retrigger while playing** (Les's rule, 2026-10-31) | `is_playing`, and `current_song_time` within the beats Live can have played since the burst (+¼ beat) of the target |
+| `POST /api/mix/play` | **play-then-locate** (M0 row 3, §1): reads the stopped `current_song_time` (the position the panel shows), mutes every unmuted track, then `continue_playing` + `set/current_song_time <that position>`, re-sending the locate until confirmed (§1), then restores exactly those mutes | refused if a fresh `is_playing` read is true: **never retrigger while playing** (Les's rule, 2026-10-31) | `is_playing`, and `current_song_time` within the beats Live can have played since the burst (+¼ beat) of the target |
 | `POST /api/mix/stop` | `stop_playing` | refused if already stopped, so the API never issues Live's second-stop "return to start" by accident | `is_playing`, `current_song_time` |
 | `POST /api/mix/locate {beat}` | `set/current_song_time beat` | refused while playing (position is set while stopped); `beat ≥ 0` | `current_song_time` |
 | `POST /api/mix/mute {index, name, mute}` | `track/set/mute index 0/1` | refused if the track at `index` no longer has `name` (the page is stale after a set change) | that track's `mute` |
@@ -382,9 +396,8 @@ the job of bert-architecture#14's readiness gate (§8).
 ┌─────────────────── chart (scrolls) ───────────────────┐
 │ …bars…                                                │
 ├───────────────────────────────────────────────────────┤  collapsed strip, 64 px
-│ [▶ Play] [■ Stop]   bar 17 . 3   104 BPM 4/4   ● Live  [▴]│
+│ [▶][■] [|◀ 1.1][◀ bar][bar ▶]  bar 17 . 3  104 4/4 ● [▴]│
 ├───────────────────────────────────────────────────────┤  expanded tray (+ ~40% vh max)
-│ [|◀ 1.1] [◀ bar] [bar ▶]                               │
 │ ┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐      │
 │ │Drums││Bass ││Keys ││Gtr  ││Pad  ││Vox  ││Click│ …    │  mute grid (wraps; scrolls if needed)
 │ └─────┘└─────┘└─────┘└─────┘└─────┘└─────┘└─────┘      │
@@ -395,9 +408,11 @@ the job of bert-architecture#14's readiness gate (§8).
   bottom padding equal to the panel height, so the last row is never
   hidden. The panel sits below the edit overlay (z-index under 1000), so
   editing covers it.
-- **Collapsed** is the slim strip: Play, Stop, the position readout, tempo
-  and meter, Live status, and the expand toggle **[default; Les may
-  prefer fully hidden, §9]**. Collapsed vs expanded is kept in
+- **Collapsed** is the slim strip: Play, Stop, the position buttons, the
+  position readout, tempo and meter, Live status, and the expand toggle
+  **[default; Les may prefer fully hidden, §9]**. All transport control
+  lives in the strip, and the tray holds only the mute grid, so hiding the
+  tracks never hides the transport (Les, M2 rig session). Collapsed vs expanded is kept in
   `localStorage`, like the CUA/VIM editor choice from #12.
 - **Touch sizing:** at least 56 px for every target, 72 px for Play and
   Stop, and at least 8 px between targets. Labels are at least 16 px.
@@ -406,7 +421,10 @@ the job of bert-architecture#14's readiness gate (§8).
 - **Mute tiles** follow Live's own Track Activator meaning: a lit tile is
   a sounding track, and a dark tile with the name struck through is muted.
   The tile's left edge carries the track colour, so it matches what Les
-  sees in Live. Group tracks get a small "group" marker. Child tracks
+  sees in Live, and a colour change in Live redraws the grid. Tiles are
+  compact (112 px wide, 44 px tall, 13 px text, up to two lines) because
+  space is tight. That's an exception to the 56 px rule, accepted on the
+  M2 rig and due for re-tuning on the new touch panel. Group tracks get a small "group" marker. Child tracks
   appear in Live order right after their group. **[default: show every
   track in `song.tracks`, in order; §9]**
 - **Position readout** is `bar.beat` from `current_song_time` and the
@@ -449,6 +467,15 @@ layer.
 reads included, because port 8080 is internet-reachable and the state
 includes the mix set's track names. Without `--mixroom` the routes answer
 404 and the page has no panel.
+
+As built in M2: a command answers `{ok, status, error, state}`, where
+`state` is always the re-read state, whatever the outcome. The HTTP status
+follows `status`: `ok` 200, `refused` 409, `unconfirmed` 504 ("no
+confirmation from Live"), `unreachable` 502. `GET /api/mix/state` answers
+`{ok: true, state}`. `--mixroom` without `SONGML_WRITE_TOKEN` is a startup
+error, not a server without a panel: the flag asks for something the server
+couldn't deliver. songml-serve turns SIGTERM (systemd's stop) into a clean
+exit, so the mix layer drains in-flight replies before it releases 11001.
 
 ## 5. Security
 

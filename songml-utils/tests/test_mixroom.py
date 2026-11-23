@@ -177,8 +177,11 @@ def test_tracks_rev_bumps_on_set_change(rig: Rig) -> None:
         fake.song.tracks[0].name = "Mic 1 (dbl)"
     assert wait_until(lambda: layer.state()["tracks_rev"] == 3)
     with fake.lock:
-        fake.song.tracks.clear()
+        fake.song.tracks[1].color = 0x00FF00  # rig M2: recolor alone redraws the grid
     assert wait_until(lambda: layer.state()["tracks_rev"] == 4)
+    with fake.lock:
+        fake.song.tracks.clear()
+    assert wait_until(lambda: layer.state()["tracks_rev"] == 5)
     assert layer.state()["tracks"] == []
 
 
@@ -226,8 +229,68 @@ def test_play_is_play_then_locate(rig: Rig) -> None:
     assert res.state["playing"] is True
     assert 32.0 <= res.state["beat"] < 33.0
     sent = [a for a, _ in fake.received if not a.startswith("/live/song/get")]
-    assert sent[-2:] == ["/live/song/continue_playing", "/live/song/set/current_song_time"]
+    burst = [a for a in sent if a != "/live/track/set/mute"]
+    assert burst[-2:] == ["/live/song/continue_playing", "/live/song/set/current_song_time"]
     assert "/live/song/start_playing" not in sent
+
+
+def test_play_mutes_audible_tracks_through_the_jump(rig: Rig) -> None:
+    """Rig M2: nothing is audible from the old position; Les's own mutes are untouched."""
+    fake, layer = rig
+    with fake.lock:
+        fake.song.tracks[1].mute = True  # Les muted Bite piano
+        fake.song.last_stop = 80.0
+    fake.start_latency = 0.08
+    assert layer.locate(0).ok
+    with fake.lock:
+        n = len(fake.received)
+    res = layer.play()
+    assert res.ok, res.reason
+    msgs = [(a, list(args)) for a, args in fake.received[n:] if not a.startswith("/live/song/get")]
+    cont = msgs.index(("/live/song/continue_playing", []))
+    last_locate = max(i for i, (a, _) in enumerate(msgs) if a == "/live/song/set/current_song_time")
+    mutes = [args for a, args in msgs[:cont] if a == "/live/track/set/mute"]
+    unmutes = [args for a, args in msgs[last_locate:] if a == "/live/track/set/mute"]
+    assert sorted(mutes) == [[0, 1], [2, 1], [3, 1]]
+    assert sorted(unmutes) == [[0, 0], [2, 0], [3, 0]]
+    with fake.lock:
+        assert [t.mute for t in fake.song.tracks] == [False, True, False, False]
+
+
+def test_play_restores_mutes_when_unconfirmed(rig: Rig) -> None:
+    fake, layer = rig
+    with fake.lock:
+        fake.song.last_stop = 80.0
+    fake.start_latency = 60.0
+    assert layer.locate(0).ok
+    res = layer.play()
+    assert res.status == "unconfirmed"
+    with fake.lock:
+        assert not any(t.mute for t in fake.song.tracks)
+
+
+def test_play_relocates_when_live_starts_late(rig: Rig) -> None:
+    """Rig M2: the first locate after continue_playing is lost; Play re-sends it."""
+    fake, layer = rig
+    with fake.lock:
+        fake.song.last_stop = 80.0
+    fake.start_latency = 0.08
+    assert layer.locate(0).ok
+    res = layer.play()
+    assert res.ok, res.reason
+    assert 0.0 <= res.state["beat"] < 1.0
+    sets = [a for a, _ in fake.received if a == "/live/song/set/current_song_time"]
+    assert len(sets) >= 3, "the stopped locate, the lost one, and at least one retry"
+
+
+def test_play_unconfirmed_when_locate_never_sticks(rig: Rig) -> None:
+    fake, layer = rig
+    with fake.lock:
+        fake.song.last_stop = 80.0
+    fake.start_latency = 60.0
+    assert layer.locate(0).ok
+    res = layer.play()
+    assert res.status == "unconfirmed" and "not 0.00" in res.reason
 
 
 def test_fake_reproduces_m0_row3() -> None:

@@ -2,7 +2,7 @@
 
 Design: ``docs/mixroom-transport-design.md`` (sanekits/songml#14, #15). This module is the
 M1 slice: the OSC client, the poll loop, the watched window, the command guards and the
-read-after-write checks. M2 wires it into ``songml-serve --mixroom`` as ``/api/mix/*``.
+read-after-write checks. ``songml-serve --mixroom`` (M2) serves it as ``/api/mix/*``.
 
 Shape:
 
@@ -73,6 +73,15 @@ TRACK_NAME = "/live/track/get/name"
 LOCATE_TOLERANCE = 1e-3
 # Slack on top of the beats Live can play between the play burst and the re-read.
 PLAY_POSITION_SLACK = 0.25
+# Play-then-locate on the rig (M2, 2026-11-22): a set/current_song_time sent in the same
+# burst as continue_playing can land before Live's transport is actually running, and
+# Live drops it like a stopped locate. So Play re-sends the locate until Live reads back
+# playing at the target, up to this many tries, this many seconds apart.
+PLAY_LOCATE_TRIES = 6
+PLAY_LOCATE_RETRY_S = 0.05
+# After Live confirms the position, hold the jump mutes this long so audio Live already
+# rendered from the old position drains before the tracks come back.
+PLAY_UNMUTE_DELAY_S = 0.05
 
 
 @dataclass(frozen=True)
@@ -167,7 +176,7 @@ class MixLayer:
         self._slots: dict[str, _Slot] = {}
         self._inflight: dict[str, float] = {}
         self._tracks: list[dict[str, Any]] = []
-        self._tracks_key: tuple[str, ...] | None = None
+        self._tracks_key: tuple[tuple[str, int, bool, bool], ...] | None = None
         self._tracks_rev = 0
         self._tracks_at: float | None = None
         self._last_watch: float | None = None
@@ -322,7 +331,9 @@ class MixLayer:
         self._set_tracks(tracks, now)
 
     def _set_tracks(self, tracks: list[dict[str, Any]], now: float) -> None:
-        key = tuple(t["name"] for t in tracks)
+        # Everything the panel draws a tile from except mute (rig M2: a color change in
+        # Live must redraw the grid, not wait for a page reload).
+        key = tuple((t["name"], t["color"], t["grouped"], t["foldable"]) for t in tracks)
         if key != self._tracks_key:
             self._tracks_key = key
             self._tracks_rev += 1
@@ -436,20 +447,72 @@ class MixLayer:
         if target_r is None or tempo_r is None:
             return self._unreachable()
         target, tempo = float(target_r[0]), float(tempo_r[0])
-        sent = self.clock()
+        count = self._query(NUM_TRACKS)
+        if count is None:
+            return self._unreachable()
+        n = int(count[0])
+        data = self._query(TRACK_DATA, [0, n, *TRACK_PROPS]) if n else []
+        if data is None:
+            return self._unreachable()
+        width = len(TRACK_PROPS)
+        names = [str(data[i]) for i in range(0, len(data), width)]
+        audible = [i // width for i in range(0, len(data), width) if not data[i + 1]]
+        # Silence the bounce (rig M2): Live plays from its last stop for about one tick
+        # before the locate lands. Mutes go out before continue_playing, and AbletonOSC
+        # applies messages in order, so nothing is audible until the position is right.
+        for i in audible:
+            self._send("/live/track/set/mute", [i, 1])
+        try:
+            result = self._play_then_locate(target, tempo)
+            if result.ok:
+                time.sleep(PLAY_UNMUTE_DELAY_S)
+        finally:
+            stuck = self._restore_mutes(audible, names)
+        if stuck:
+            return self._unconfirmed(stuck)
+        return result
+
+    def _restore_mutes(self, indices: list[int], names: list[str]) -> str:
+        """Unmute what Play muted and confirm it. Returns "" or the reason it didn't stick."""
+        if not indices:
+            return ""
+        for i in indices:
+            self._send("/live/track/set/mute", [i, 0])
+        width = len(TRACK_PROPS)
+        still: list[int] = list(indices)
+        for attempt in range(PLAY_LOCATE_TRIES):
+            if attempt:
+                time.sleep(PLAY_LOCATE_RETRY_S)
+            data = self._query(TRACK_DATA, [0, len(names), *TRACK_PROPS])
+            if data is None:
+                continue
+            still = [i for i in indices if i * width + 1 < len(data) and data[i * width + 1]]
+            if not still:
+                return ""
+        listed = ", ".join(names[i] for i in still)
+        return f"Play muted tracks for the jump and could not confirm unmuting: {listed}"
+
+    def _play_then_locate(self, target: float, tempo: float) -> CommandResult:
         self._send("/live/song/continue_playing")
-        self._send("/live/song/set/current_song_time", [target])
-        playing = self._query("/live/song/get/is_playing")
-        pos_r = self._query("/live/song/get/current_song_time")
-        if playing is None or pos_r is None:
-            return self._unconfirmed()
-        if not playing[0]:
-            return self._unconfirmed("Live is still stopped")
-        pos = float(pos_r[0])
-        reach = tempo / 60.0 * (self.clock() - sent) + PLAY_POSITION_SLACK
-        if not target - LOCATE_TOLERANCE <= pos <= target + reach:
-            return self._unconfirmed(f"Live is playing from beat {pos:.2f}, not {target:.2f}")
-        return self._result("ok")
+        reason = "Live is still stopped"
+        for attempt in range(PLAY_LOCATE_TRIES):
+            if attempt:
+                time.sleep(PLAY_LOCATE_RETRY_S)
+            sent = self.clock()
+            self._send("/live/song/set/current_song_time", [target])
+            playing = self._query("/live/song/get/is_playing")
+            pos_r = self._query("/live/song/get/current_song_time")
+            if playing is None or pos_r is None:
+                return self._unconfirmed()
+            if not playing[0]:
+                reason = "Live is still stopped"
+                continue
+            pos = float(pos_r[0])
+            reach = tempo / 60.0 * (self.clock() - sent) + PLAY_POSITION_SLACK
+            if target - LOCATE_TOLERANCE <= pos <= target + reach:
+                return self._result("ok")
+            reason = f"Live is playing from beat {pos:.2f}, not {target:.2f}"
+        return self._unconfirmed(reason)
 
     def stop(self) -> CommandResult:
         playing = self._query("/live/song/get/is_playing")
@@ -460,13 +523,16 @@ class MixLayer:
                 "refused", "already stopped: a second Stop would return Live to the start"
             )
         self._send("/live/song/stop_playing")
-        playing = self._query("/live/song/get/is_playing")
-        pos = self._query("/live/song/get/current_song_time")
-        if playing is None or pos is None:
-            return self._unconfirmed()
-        if playing[0]:
-            return self._unconfirmed("Live is still playing")
-        return self._result("ok")
+        for attempt in range(PLAY_LOCATE_TRIES):
+            if attempt:
+                time.sleep(PLAY_LOCATE_RETRY_S)
+            playing = self._query("/live/song/get/is_playing")
+            pos = self._query("/live/song/get/current_song_time")
+            if playing is None or pos is None:
+                return self._unconfirmed()
+            if not playing[0]:
+                return self._result("ok")
+        return self._unconfirmed("Live is still playing")
 
     def locate(self, beat: object) -> CommandResult:
         if (
@@ -482,12 +548,17 @@ class MixLayer:
         if playing[0]:
             return self._result("refused", "position is set while stopped")
         self._send("/live/song/set/current_song_time", [float(beat)])
-        pos = self._query("/live/song/get/current_song_time")
-        if pos is None:
-            return self._unconfirmed()
-        if abs(float(pos[0]) - beat) > LOCATE_TOLERANCE:
-            return self._unconfirmed(f"Live is at beat {float(pos[0]):.3f}, not {beat}")
-        return self._result("ok")
+        reason = ""
+        for attempt in range(PLAY_LOCATE_TRIES):
+            if attempt:
+                time.sleep(PLAY_LOCATE_RETRY_S)
+            pos = self._query("/live/song/get/current_song_time")
+            if pos is None:
+                return self._unconfirmed()
+            if abs(float(pos[0]) - beat) <= LOCATE_TOLERANCE:
+                return self._result("ok")
+            reason = f"Live is at beat {float(pos[0]):.3f}, not {beat}"
+        return self._unconfirmed(reason)
 
     def mute(self, index: object, name: object, mute: object) -> CommandResult:
         if isinstance(index, bool) or not isinstance(index, int) or index < 0:
@@ -514,7 +585,8 @@ class MixLayer:
         got = self._query(TRACK_MUTE, [index])
         if got is None:
             return self._unconfirmed()
-        if got != [index, mute]:
+        # Normalize: AbletonOSC may answer the mute as int 0/1 rather than T/F.
+        if len(got) != 2 or got[0] != index or bool(got[1]) != mute:
             return self._unconfirmed(f"track {index} mute reads {got[-1]}")
         return self._result("ok")
 

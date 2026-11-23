@@ -17,6 +17,8 @@ things the M0 spike found on the real rig (sanekits/songml#14, 2026-11-22):
 
 Faults for tests: ``silent`` (receive but never answer), ``ignore`` (addresses whose
 *effects and replies* are dropped), and ``reply_delay`` (seconds added before each reply).
+``int_mutes`` answers ``track/get/mute`` with int 0/1 instead of T/F, which real
+AbletonOSC may do.
 """
 
 from __future__ import annotations
@@ -78,6 +80,9 @@ class FakeAbletonOSC:
         self.silent = False
         self.ignore: set[str] = set()
         self.reply_delay = 0.0
+        self.int_mutes = False
+        # Seconds after continue/start_playing during which a locate is dropped (rig M2).
+        self.start_latency = 0.0
         self.dead_reason: str | None = None
         self.received: list[tuple[str, list[OSCArg]]] = []
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -153,6 +158,8 @@ class FakeAbletonOSC:
             return []
         if address == "/live/song/set/current_song_time":
             beat = float(args[0])
+            if s.playing and self.clock() - s.play_t0 < self.start_latency:
+                return []  # rig M2: Live's transport isn't running yet, the locate is lost
             if s.playing:
                 s.play_base = beat
                 s.play_t0 = self.clock()
@@ -176,7 +183,10 @@ class FakeAbletonOSC:
             if not 0 <= index < len(tracks):
                 return [("/live/error", [f"{address}: index out of range {index}"])]
             attr = address.rsplit("/", 1)[1]
-            return [(address, [index, getattr(tracks[index], attr)])]
+            value = getattr(tracks[index], attr)
+            if attr == "mute" and self.int_mutes:
+                value = int(value)
+            return [(address, [index, value])]
         if address == "/live/track/set/mute":
             index = int(args[0])
             if not 0 <= index < len(tracks):

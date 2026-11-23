@@ -55,7 +55,12 @@ def _read_string(data: bytes, pos: int) -> tuple[str, int]:
     end = data.find(b"\x00", pos)
     if end < 0:
         raise OSCError("unterminated OSC string")
-    text = data[pos:end].decode("utf-8")
+    try:
+        text = data[pos:end].decode("utf-8")
+    except UnicodeDecodeError as e:
+        # A garbage datagram must not escape as a non-OSCError: the mix layer's receive
+        # loop catches OSCError only, and anything else would kill it.
+        raise OSCError(f"OSC string is not UTF-8: {e}") from e
     return text, end + (4 - (end - pos) % 4)
 
 

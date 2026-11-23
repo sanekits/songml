@@ -281,6 +281,294 @@ _EDIT_JS = """
 })();
 """
 
+_MIX_CSS = """
+#songml-mix{position:fixed;left:0;right:0;bottom:0;z-index:900;background:#202124;color:#e8eaed;
+  box-shadow:0 -2px 8px rgba(0,0,0,.35);font-size:16px;user-select:none;-webkit-user-select:none;
+  touch-action:manipulation}
+#songml-mix button{font:inherit;color:inherit;border:none;border-radius:8px;cursor:pointer;
+  min-width:56px;min-height:56px;padding:0 14px;background:#3c4043}
+#songml-mix button:disabled{opacity:.35;cursor:default}
+#songml-mix button.busy{outline:3px solid #fbbc04}
+.mix-strip{display:flex;align-items:center;gap:8px;padding:4px 8px;min-height:64px;flex-wrap:wrap}
+#songml-mix .mix-play,#songml-mix .mix-stop{min-width:72px;min-height:56px;font-size:20px;font-weight:700}
+#songml-mix .mix-play{background:#0b8043}
+#songml-mix .mix-stop{background:#a50e0e}
+.mix-pos{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;min-width:7.5em}
+.mix-meta{color:#bdc1c6;font-variant-numeric:tabular-nums}
+.mix-live{display:flex;align-items:center;gap:6px;color:#bdc1c6}
+.mix-dot{width:12px;height:12px;border-radius:50%;background:#5f6368}
+.mix-live.ok .mix-dot{background:#34a853}
+.mix-live.down .mix-dot{background:#ea4335}
+.mix-msg{flex:1;min-width:8em;color:#fbbc04;font-size:15px;line-height:1.25}
+#songml-mix.down .mix-pos,#songml-mix.down .mix-meta{opacity:.4}
+#songml-mix .mix-toggle{margin-left:auto}
+.mix-tray{display:none;border-top:1px solid #3c4043;padding:8px;max-height:40vh;overflow-y:auto}
+#songml-mix.expanded .mix-tray{display:block}
+.mix-posctl{display:flex;gap:6px}
+#songml-mix .mix-posctl button{min-width:48px;padding:0 10px;font-size:15px}
+.mix-grid{display:flex;flex-wrap:wrap;gap:6px}
+#songml-mix .mix-tile{min-width:0;width:112px;min-height:44px;padding:3px 6px 3px 8px;
+  font-size:13px;line-height:1.2;text-align:left;background:#e8eaed;color:#202124;
+  border-left:6px solid var(--track-color,#808080);border-radius:6px;overflow:hidden;
+  white-space:normal;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;
+  -webkit-line-clamp:2}
+#songml-mix .mix-tile.muted{background:#3c4043;color:#9aa0a6;text-decoration:line-through}
+#songml-mix .mix-tile.child{margin-left:0;border-left-style:double;border-left-width:9px}
+.mix-group{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+  margin-right:6px;padding:1px 4px;border:1px solid currentColor;border-radius:3px;text-decoration:none}
+.mix-empty{color:#9aa0a6}
+"""
+
+_MIX_JS = """
+// SongML mixroom panel (design: docs/mixroom-transport-design.md §4). Injected by
+// songml-serve only with --mixroom and editing enabled. __WRITE_TOKEN__ is
+// substituted server-side with a JSON-quoted value. The page only ever shows state
+// read back from Live: a press shows "busy" until the command's re-read arrives.
+(function () {
+  'use strict';
+  var WRITE_TOKEN = __WRITE_TOKEN__;
+  var KEY_EXPANDED = 'songml.mix.expanded';
+  var panel = document.getElementById('songml-mix');
+  if (!panel) return;
+
+  function $(cls) { return panel.querySelector('.' + cls); }
+  var playBtn = $('mix-play'), stopBtn = $('mix-stop'), posEl = $('mix-pos');
+  var metaEl = $('mix-meta'), liveEl = $('mix-live'), liveText = $('mix-live-text');
+  var msgEl = $('mix-msg'), toggleBtn = $('mix-toggle'), grid = $('mix-grid');
+  var homeBtn = $('mix-home'), prevBtn = $('mix-prev'), nextBtn = $('mix-next');
+
+  var state = null;          // last state read from the server
+  var renderedRev = null;    // tracks_rev the mute grid was built for
+  var busy = false;          // a command is in flight
+  var pollTimer = null, polling = false;
+  var statusMsg = '';        // standing condition (Live down, server down); '' when fine
+  var flashMsg = '', flashUntil = 0;  // a command's refusal or failure, shown for 4 s
+
+  var expanded = false;
+  try { expanded = localStorage.getItem(KEY_EXPANDED) === '1'; } catch (e) {}
+
+  function barLen(s) {
+    var num = s.signature && s.signature[0], den = s.signature && s.signature[1];
+    if (!num || !den) return null;
+    return num * 4 / den;  // Live beats are quarter notes
+  }
+
+  function curBar(s) {  // 1-based Live bar containing the current position
+    var len = barLen(s);
+    if (len === null || s.beat === null) return null;
+    return Math.floor(s.beat / len + 1e-6) + 1;
+  }
+
+  function posText(s) {
+    var len = barLen(s);
+    if (len === null || s.beat === null) return 'bar \\u2013';
+    var bar = curBar(s);
+    var inBar = (s.beat - (bar - 1) * len) * s.signature[1] / 4;
+    return 'bar ' + bar + ' . ' + (Math.floor(inBar + 1e-6) + 1);
+  }
+
+  function showMsg() {
+    msgEl.textContent = Date.now() < flashUntil ? flashMsg : statusMsg;
+  }
+
+  function flash(text) {
+    flashMsg = text;
+    flashUntil = Date.now() + 4000;
+    showMsg();
+    setTimeout(showMsg, 4050);
+  }
+
+  function setExpanded(on) {
+    expanded = on;
+    panel.classList.toggle('expanded', on);
+    toggleBtn.textContent = on ? '\\u25be' : '\\u25b4';
+    toggleBtn.setAttribute('aria-label', on ? 'Hide track mutes' : 'Show track mutes');
+    try { localStorage.setItem(KEY_EXPANDED, on ? '1' : '0'); } catch (e) {}
+    fitBody();
+    schedule(0);
+  }
+
+  function fitBody() {  // keep the last chart row clear of the fixed panel
+    document.body.style.paddingBottom = (panel.offsetHeight + 16) + 'px';
+  }
+
+  function buildGrid(tracks) {
+    grid.textContent = '';
+    if (!tracks.length) {
+      var empty = document.createElement('span');
+      empty.className = 'mix-empty';
+      empty.textContent = 'No tracks in the mixroom set.';
+      grid.appendChild(empty);
+      return;
+    }
+    tracks.forEach(function (t) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'mix-tile' + (t.grouped ? ' child' : '');
+      b.dataset.index = String(t.index);
+      b.dataset.name = t.name;
+      b.style.setProperty('--track-color', '#' + ('000000' + t.color.toString(16)).slice(-6));
+      if (t.foldable) {
+        var g = document.createElement('span');
+        g.className = 'mix-group';
+        g.textContent = 'group';
+        b.appendChild(g);
+      }
+      b.appendChild(document.createTextNode(t.name));
+      b.addEventListener('click', function () { onMute(b); });
+      grid.appendChild(b);
+    });
+  }
+
+  function render() {
+    var s = state;
+    var up = !!s && s.live === 'ok';
+    liveEl.classList.toggle('ok', up);
+    liveEl.classList.toggle('down', !!s && !up);
+    panel.classList.toggle('down', !up);  // greys the last-read position: it's stale
+    liveText.textContent = !s ? 'Live \\u2026' : up ? 'Live' : 'Live not answering';
+    liveEl.title = (s && s.reason) || '';
+    if (s) statusMsg = up ? '' : (s.reason || 'mixroom Live not answering');
+    showMsg();
+    if (!s) {
+      [playBtn, stopBtn, homeBtn, prevBtn, nextBtn].forEach(function (b) { b.disabled = true; });
+      Array.prototype.forEach.call(grid.querySelectorAll('.mix-tile'),
+                                   function (b) { b.disabled = true; });
+      return;
+    }
+    posEl.textContent = posText(s);
+    var sig = s.signature && s.signature[0] ? s.signature[0] + '/' + s.signature[1] : '';
+    metaEl.textContent = (s.tempo !== null ? Math.round(s.tempo * 10) / 10 + ' BPM ' : '') + sig;
+    var stopped = up && s.playing === false, playing = up && s.playing === true;
+    playBtn.disabled = busy || !stopped;
+    stopBtn.disabled = busy || !playing;
+    var bar = curBar(s);
+    homeBtn.disabled = busy || !stopped;
+    prevBtn.disabled = busy || !stopped || bar === null || s.beat <= 0;
+    nextBtn.disabled = busy || !stopped || bar === null;
+    if (s.tracks_rev !== renderedRev) {
+      buildGrid(s.tracks);
+      renderedRev = s.tracks_rev;
+      fitBody();
+    }
+    var byIndex = {};
+    s.tracks.forEach(function (t) { byIndex[t.index] = t; });
+    Array.prototype.forEach.call(grid.querySelectorAll('.mix-tile'), function (b) {
+      var t = byIndex[Number(b.dataset.index)];
+      b.classList.toggle('muted', !!t && t.mute);
+      b.setAttribute('aria-pressed', t && t.mute ? 'true' : 'false');
+      b.disabled = busy || !up;
+    });
+  }
+
+  function schedule(delay) {
+    clearTimeout(pollTimer);
+    if (document.hidden) return;  // resumes on visibilitychange
+    pollTimer = setTimeout(poll, delay);
+  }
+
+  async function poll() {
+    if (polling) return;
+    polling = true;
+    try {
+      var resp = await fetch('/api/mix/state?token=' + encodeURIComponent(WRITE_TOKEN),
+                             { cache: 'no-store' });
+      var data = await resp.json();
+      if (resp.ok && data.ok) {
+        state = data.state;
+      } else {
+        state = null;
+        statusMsg = 'Mix state failed: ' + (data.error || ('HTTP ' + resp.status));
+      }
+    } catch (e) {
+      state = null;
+      statusMsg = 'songml-serve not answering';
+    } finally {
+      polling = false;
+    }
+    render();
+    schedule(expanded ? 250 : 1000);
+  }
+
+  async function command(name, body, btn) {
+    if (busy) return;
+    busy = true;
+    if (btn) btn.classList.add('busy');
+    render();
+    var payload = Object.assign({ token: WRITE_TOKEN }, body || {});
+    try {
+      var resp = await fetch('/api/mix/' + name, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      var data = await resp.json();
+      if (data.state) state = data.state;  // the re-read state, whatever the outcome
+      if (!data.ok) flash(data.error || ('HTTP ' + resp.status));
+    } catch (e) {
+      flash(name + ' failed: ' + e);
+    } finally {
+      busy = false;
+      if (btn) btn.classList.remove('busy');
+    }
+    render();
+  }
+
+  function locateBar(bar) {  // bar is a 1-based Live bar
+    var len = barLen(state);
+    if (len === null) return;
+    return command('locate', { beat: Math.max(0, (bar - 1) * len) });
+  }
+
+  function onMute(b) {
+    var muted = b.classList.contains('muted');
+    command('mute', { index: Number(b.dataset.index), name: b.dataset.name, mute: !muted }, b);
+  }
+
+  // Buttons act on click, which fires only when the press is released inside the
+  // target: a finger sliding off cancels (§4.1).
+  playBtn.addEventListener('click', function () { command('play', null, playBtn); });
+  stopBtn.addEventListener('click', function () { command('stop', null, stopBtn); });
+  homeBtn.addEventListener('click', function () { command('locate', { beat: 0 }, homeBtn); });
+  prevBtn.addEventListener('click', function () {
+    // From mid-bar, back to this bar's start; from a bar start, the previous bar.
+    var len = barLen(state), bar = curBar(state);
+    var atStart = Math.abs(state.beat - (bar - 1) * len) < 1e-3;
+    locateBar(Math.max(1, atStart ? bar - 1 : bar));
+  });
+  nextBtn.addEventListener('click', function () { locateBar(curBar(state) + 1); });
+  toggleBtn.addEventListener('click', function () { setExpanded(!expanded); });
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) clearTimeout(pollTimer); else schedule(0);
+  });
+  window.addEventListener('resize', fitBody);
+
+  setExpanded(expanded);
+  render();
+})();
+"""
+
+_MIX_HTML = """<div id="songml-mix" role="region" aria-label="Mixroom transport">
+<div class="mix-strip">
+<button type="button" class="mix-play" aria-label="Play" disabled>&#9654;</button>
+<button type="button" class="mix-stop" aria-label="Stop" disabled>&#9632;</button>
+<span class="mix-posctl">
+<button type="button" class="mix-home" disabled>|&#9664; 1.1</button>
+<button type="button" class="mix-prev" disabled>&#9664; bar</button>
+<button type="button" class="mix-next" disabled>bar &#9654;</button>
+</span>
+<span class="mix-pos">bar &ndash;</span>
+<span class="mix-meta"></span>
+<span class="mix-live"><span class="mix-dot"></span><span class="mix-live-text">Live &hellip;</span></span>
+<span class="mix-msg" role="status"></span>
+<button type="button" class="mix-toggle" aria-label="Show track mutes">&#9652;</button>
+</div>
+<div class="mix-tray">
+<div class="mix-grid"></div>
+</div>
+</div>
+"""
+
 
 def to_html_string(
     doc: Document,
@@ -290,6 +578,7 @@ def to_html_string(
     editable: bool = False,
     write_token: str | None = None,
     song_path: str | None = None,
+    mixroom: bool = False,
 ) -> str:
     title = _prop(doc, "Title", "Untitled")
     key = _prop(doc, "Key", "")
@@ -376,13 +665,22 @@ def to_html_string(
         if can_edit
         else ""
     )
+    # The mixroom panel needs the write token too: every /api/mix/* call is gated.
+    show_mix = can_edit and mixroom
+    mix_css = _MIX_CSS if show_mix else ""
+    mix_html = _MIX_HTML if show_mix else ""
+    mix_script = (
+        "<script>\n" + _MIX_JS.replace("__WRITE_TOKEN__", _json.dumps(write_token)) + "\n</script>"
+        if show_mix
+        else ""
+    )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{t}</title>
-<style>{_CSS}{edit_css}</style>
+<style>{_CSS}{edit_css}{mix_css}</style>
 </head>
 <body>
 <div class="song">
@@ -391,7 +689,7 @@ def to_html_string(
 <div class="meta">{" &bull; ".join(meta_parts)}</div>
 {"".join(strips)}
 </div>
-{edit_script}</body>
+{mix_html}{edit_script}{mix_script}</body>
 </html>"""
 
 
