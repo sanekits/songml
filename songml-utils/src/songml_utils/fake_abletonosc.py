@@ -81,6 +81,8 @@ class FakeAbletonOSC:
         self.ignore: set[str] = set()
         self.reply_delay = 0.0
         self.int_mutes = False
+        # Seconds after continue/start_playing during which a locate is dropped (rig M2).
+        self.start_latency = 0.0
         self.dead_reason: str | None = None
         self.received: list[tuple[str, list[OSCArg]]] = []
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -156,6 +158,8 @@ class FakeAbletonOSC:
             return []
         if address == "/live/song/set/current_song_time":
             beat = float(args[0])
+            if s.playing and self.clock() - s.play_t0 < self.start_latency:
+                return []  # rig M2: Live's transport isn't running yet, the locate is lost
             if s.playing:
                 s.play_base = beat
                 s.play_t0 = self.clock()

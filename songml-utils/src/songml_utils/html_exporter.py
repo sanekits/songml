@@ -304,13 +304,17 @@ _MIX_CSS = """
 #songml-mix .mix-toggle{margin-left:auto}
 .mix-tray{display:none;border-top:1px solid #3c4043;padding:8px;max-height:40vh;overflow-y:auto}
 #songml-mix.expanded .mix-tray{display:block}
-.mix-posctl{display:flex;gap:8px;margin-bottom:8px}
-.mix-grid{display:flex;flex-wrap:wrap;gap:8px}
-#songml-mix .mix-tile{min-width:96px;max-width:200px;text-align:left;background:#e8eaed;color:#202124;
-  border-left:8px solid var(--track-color,#808080);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.mix-posctl{display:flex;gap:6px}
+#songml-mix .mix-posctl button{min-width:48px;padding:0 10px;font-size:15px}
+.mix-grid{display:flex;flex-wrap:wrap;gap:6px}
+#songml-mix .mix-tile{min-width:0;width:112px;min-height:44px;padding:3px 6px 3px 8px;
+  font-size:13px;line-height:1.2;text-align:left;background:#e8eaed;color:#202124;
+  border-left:6px solid var(--track-color,#808080);border-radius:6px;overflow:hidden;
+  white-space:normal;overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;
+  -webkit-line-clamp:2}
 #songml-mix .mix-tile.muted{background:#3c4043;color:#9aa0a6;text-decoration:line-through}
-#songml-mix .mix-tile.child{margin-left:12px}
-.mix-group{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+#songml-mix .mix-tile.child{margin-left:0;border-left-style:double;border-left-width:9px}
+.mix-group{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
   margin-right:6px;padding:1px 4px;border:1px solid currentColor;border-radius:3px;text-decoration:none}
 .mix-empty{color:#9aa0a6}
 """
@@ -378,7 +382,7 @@ _MIX_JS = """
     expanded = on;
     panel.classList.toggle('expanded', on);
     toggleBtn.textContent = on ? '\\u25be' : '\\u25b4';
-    toggleBtn.setAttribute('aria-label', on ? 'Collapse mix panel' : 'Expand mix panel');
+    toggleBtn.setAttribute('aria-label', on ? 'Hide track mutes' : 'Show track mutes');
     try { localStorage.setItem(KEY_EXPANDED, on ? '1' : '0'); } catch (e) {}
     fitBody();
     schedule(0);
@@ -548,18 +552,18 @@ _MIX_HTML = """<div id="songml-mix" role="region" aria-label="Mixroom transport"
 <div class="mix-strip">
 <button type="button" class="mix-play" aria-label="Play" disabled>&#9654;</button>
 <button type="button" class="mix-stop" aria-label="Stop" disabled>&#9632;</button>
+<span class="mix-posctl">
+<button type="button" class="mix-home" disabled>|&#9664; 1.1</button>
+<button type="button" class="mix-prev" disabled>&#9664; bar</button>
+<button type="button" class="mix-next" disabled>bar &#9654;</button>
+</span>
 <span class="mix-pos">bar &ndash;</span>
 <span class="mix-meta"></span>
 <span class="mix-live"><span class="mix-dot"></span><span class="mix-live-text">Live &hellip;</span></span>
 <span class="mix-msg" role="status"></span>
-<button type="button" class="mix-toggle" aria-label="Expand mix panel">&#9652;</button>
+<button type="button" class="mix-toggle" aria-label="Show track mutes">&#9652;</button>
 </div>
 <div class="mix-tray">
-<div class="mix-posctl">
-<button type="button" class="mix-home" disabled>|&#9664; 1.1</button>
-<button type="button" class="mix-prev" disabled>&#9664; bar</button>
-<button type="button" class="mix-next" disabled>bar &#9654;</button>
-</div>
 <div class="mix-grid"></div>
 </div>
 </div>
