@@ -306,3 +306,23 @@ class TestMainCLI:
         with pytest.raises(SystemExit) as exc_info:
             main()
         assert exc_info.value.code == 1
+
+
+def test_render_song_fills_template_and_formats():
+    from songml_utils.create import render_song
+    from songml_utils.formatter import format_songml
+
+    content = render_song("Shared Song", "Amin")
+    assert "{{" not in content
+    assert "Title: Shared Song" in content
+    assert "Key: Amin" in content
+    assert format_songml(content) == content
+
+
+def test_render_song_rejects_bad_key():
+    import pytest
+
+    from songml_utils.create import render_song
+
+    with pytest.raises(ValueError):
+        render_song("x", "Q")

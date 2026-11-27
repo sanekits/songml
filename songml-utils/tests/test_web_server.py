@@ -592,3 +592,160 @@ class TestEditButton:
         status, body = _make_request(handler_cls, "GET", "/song/test.songml")
         assert status == 200
         assert "songml-edit-btn" not in body
+
+
+class TestFileManagement:
+    """songml#13: create from template, rename, delete — token-gated, root-confined."""
+
+    def _post(self, tmp_path, route, payload, token="secret"):
+        handler_cls = _make_handler(tmp_path, bars_per_row=8, write_token="secret")
+        return _make_post_request(handler_cls, {**payload, "token": token}, path=route)
+
+    def test_index_shows_controls_only_when_editing_enabled(self, tmp_path):
+        (tmp_path / "a.songml").write_text(_MINIMAL_SONGML, encoding="utf-8")
+        _, plain = _make_request(_make_handler(tmp_path, bars_per_row=8), "GET", "/")
+        assert 'id="fm-new"' not in plain and "<script>" not in plain
+        _, managed = _make_request(
+            _make_handler(tmp_path, bars_per_row=8, write_token="secret"), "GET", "/"
+        )
+        assert 'id="fm-new"' in managed
+        assert 'class="fm-rename" data-path="a.songml"' in managed
+        assert 'class="fm-delete" data-path="a.songml"' in managed
+
+    def test_index_escapes_file_names(self, tmp_path):
+        (tmp_path / "a&b <x>.songml").write_text(_MINIMAL_SONGML, encoding="utf-8")
+        _, body = _make_request(_make_handler(tmp_path, bars_per_row=8), "GET", "/")
+        assert "a&amp;b &lt;x&gt;.songml" in body
+        assert 'href="/song/a%26b%20%3Cx%3E.songml"' in body
+
+    def test_all_routes_disabled_without_server_token(self, tmp_path):
+        (tmp_path / "a.songml").write_text(_MINIMAL_SONGML, encoding="utf-8")
+        handler_cls = _make_handler(tmp_path, bars_per_row=8)
+        for route, payload in [
+            ("/api/create", {"name": "x"}),
+            ("/api/rename", {"path": "a.songml", "new_name": "b"}),
+            ("/api/delete", {"path": "a.songml"}),
+        ]:
+            status, _ = _make_post_request(handler_cls, {**payload, "token": "x"}, path=route)
+            assert status == 503, route
+        assert (tmp_path / "a.songml").exists()
+
+    def test_all_routes_reject_wrong_token(self, tmp_path):
+        (tmp_path / "a.songml").write_text(_MINIMAL_SONGML, encoding="utf-8")
+        for route, payload in [
+            ("/api/create", {"name": "x"}),
+            ("/api/rename", {"path": "a.songml", "new_name": "b"}),
+            ("/api/delete", {"path": "a.songml"}),
+        ]:
+            status, _ = self._post(tmp_path, route, payload, token="wrong")
+            assert status == 403, route
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["a.songml"]
+
+    def test_create_from_template(self, tmp_path):
+        from songml_utils.create import render_song
+
+        status, data = self._post(tmp_path, "/api/create", {"name": "My New Song", "key": "G"})
+        assert status == 200
+        assert data == {"ok": True, "path": "my-new-song.songml"}
+        content = (tmp_path / "my-new-song.songml").read_text(encoding="utf-8")
+        assert content == render_song("My New Song", "G")
+        assert "Title: My New Song" in content
+        assert "Em" in content  # vi of G from the template progression
+
+    def test_create_defaults_key_to_c_and_strips_extension(self, tmp_path):
+        status, data = self._post(tmp_path, "/api/create", {"name": "tune.songml"})
+        assert status == 200
+        assert data["path"] == "tune.songml"
+        assert "Key: C" in (tmp_path / "tune.songml").read_text(encoding="utf-8")
+
+    def test_create_refuses_existing(self, tmp_path):
+        (tmp_path / "taken.songml").write_text("keep me", encoding="utf-8")
+        status, data = self._post(tmp_path, "/api/create", {"name": "Taken"})
+        assert status == 409
+        assert "already exists" in data["error"]
+        assert (tmp_path / "taken.songml").read_text(encoding="utf-8") == "keep me"
+
+    def test_create_bad_key(self, tmp_path):
+        status, data = self._post(tmp_path, "/api/create", {"name": "x", "key": "H#"})
+        assert status == 400
+        assert "key" in data["error"].lower()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_create_requires_name(self, tmp_path):
+        status, _ = self._post(tmp_path, "/api/create", {"name": "  "})
+        assert status == 400
+
+    def test_create_cannot_escape_root(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        status, data = self._post(root, "/api/create", {"name": "../../evil"})
+        assert status == 200
+        assert data["path"] == "evil.songml"  # sanitized into the root
+        assert (root / "evil.songml").exists()
+        assert not (tmp_path / "evil.songml").exists()
+
+    def test_rename(self, tmp_path):
+        (tmp_path / "old.songml").write_text(_MINIMAL_SONGML, encoding="utf-8")
+        status, data = self._post(
+            tmp_path, "/api/rename", {"path": "old.songml", "new_name": "New Name"}
+        )
+        assert status == 200
+        assert data == {"ok": True, "path": "New Name.songml"}
+        assert not (tmp_path / "old.songml").exists()
+        assert (tmp_path / "New Name.songml").read_text(encoding="utf-8") == _MINIMAL_SONGML
+
+    def test_rename_stays_in_subdirectory(self, tmp_path):
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "a.songml").write_text(_MINIMAL_SONGML, encoding="utf-8")
+        status, data = self._post(
+            tmp_path, "/api/rename", {"path": "sub/a.songml", "new_name": "b.songml"}
+        )
+        assert status == 200
+        assert data["path"] == "sub/b.songml"
+        assert (tmp_path / "sub" / "b.songml").exists()
+
+    def test_rename_refuses_existing(self, tmp_path):
+        (tmp_path / "a.songml").write_text("A", encoding="utf-8")
+        (tmp_path / "b.songml").write_text("B", encoding="utf-8")
+        status, data = self._post(tmp_path, "/api/rename", {"path": "a.songml", "new_name": "b"})
+        assert status == 409
+        assert "already exists" in data["error"]
+        assert (tmp_path / "a.songml").read_text(encoding="utf-8") == "A"
+        assert (tmp_path / "b.songml").read_text(encoding="utf-8") == "B"
+
+    def test_rename_rejects_folder_and_traversal_names(self, tmp_path):
+        (tmp_path / "a.songml").write_text("A", encoding="utf-8")
+        for bad in ["../x", "sub/x", "..\\x", ".hidden", "", "  ", ".songml", "a:b"]:
+            status, _ = self._post(tmp_path, "/api/rename", {"path": "a.songml", "new_name": bad})
+            assert status == 400, bad
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["a.songml"]
+
+    def test_rename_source_must_be_inside_root(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        (tmp_path / "outside.songml").write_text("x", encoding="utf-8")
+        status, _ = self._post(root, "/api/rename", {"path": "../outside.songml", "new_name": "y"})
+        assert status == 403
+        assert (tmp_path / "outside.songml").exists()
+
+    def test_rename_missing_source(self, tmp_path):
+        status, _ = self._post(tmp_path, "/api/rename", {"path": "nope.songml", "new_name": "y"})
+        assert status == 404
+
+    def test_delete(self, tmp_path):
+        (tmp_path / "gone.songml").write_text(_MINIMAL_SONGML, encoding="utf-8")
+        status, data = self._post(tmp_path, "/api/delete", {"path": "gone.songml"})
+        assert status == 200
+        assert data == {"ok": True, "path": "gone.songml"}
+        assert not (tmp_path / "gone.songml").exists()
+
+    def test_delete_only_songml_inside_root(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        (root / "notes.txt").write_text("x", encoding="utf-8")
+        (tmp_path / "outside.songml").write_text("x", encoding="utf-8")
+        status, _ = self._post(root, "/api/delete", {"path": "notes.txt"})
+        assert status == 404
+        status, _ = self._post(root, "/api/delete", {"path": "../outside.songml"})
+        assert status == 403
+        assert (root / "notes.txt").exists() and (tmp_path / "outside.songml").exists()
