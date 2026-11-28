@@ -143,6 +143,29 @@ def load_template() -> str:
         return f.read()
 
 
+def render_song(song_name: str, key_input: str) -> str:
+    """Fill the basic template for a song and format it.
+
+    Shared by the songml-create CLI and songml-serve's create route.
+
+    Raises:
+        ValueError: If key format is invalid or the key is unsupported
+    """
+    root, is_minor = parse_key(key_input)
+    chords = get_chord_progression(root, is_minor)
+
+    # Replace tokens with basic chord symbols (no padding - leave formatting to format command)
+    content = load_template()
+    content = content.replace("{{title}}", song_name)
+    content = content.replace("{{key}}", key_input)
+    content = content.replace("{{I}}", chords["I"])
+    content = content.replace("{{vi}}", chords["vi"])
+    content = content.replace("{{IV}}", chords["IV"])
+    content = content.replace("{{V}}", chords["V"])
+
+    return format_songml(content)
+
+
 def create_project(song_name: str, key_input: str) -> None:
     """Create a new SongML project.
 
@@ -155,9 +178,8 @@ def create_project(song_name: str, key_input: str) -> None:
         FileExistsError: If project directory already exists
         FileNotFoundError: If template or chord voicings file not found
     """
-    # Parse inputs
-    root, is_minor = parse_key(key_input)
-    chords = get_chord_progression(root, is_minor)
+    # Render first: an invalid key fails before anything touches disk.
+    content = render_song(song_name, key_input)
     sanitized_name = sanitize_project_name(song_name)
 
     # Format key for SongML (use user input directly as specified)
@@ -166,20 +188,6 @@ def create_project(song_name: str, key_input: str) -> None:
     # Check if project directory already exists
     if os.path.exists(sanitized_name):
         raise FileExistsError(f"Project directory '{sanitized_name}' already exists")
-
-    # Load template
-    template = load_template()
-
-    # Replace tokens with basic chord symbols (no padding - leave formatting to format command)
-    content = template.replace("{{title}}", song_name)
-    content = content.replace("{{key}}", key_value)
-    content = content.replace("{{I}}", chords["I"])
-    content = content.replace("{{vi}}", chords["vi"])
-    content = content.replace("{{IV}}", chords["IV"])
-    content = content.replace("{{V}}", chords["V"])
-
-    # Format the content using the formatter
-    content = format_songml(content)
 
     # Create project directory
     os.makedirs(sanitized_name)

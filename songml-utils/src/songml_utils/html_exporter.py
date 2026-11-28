@@ -278,6 +278,11 @@ _EDIT_JS = """
   }
 
   btn.addEventListener('click', openOverlay);
+  // The library's "New song" lands here with #edit: open the editor straight away.
+  if (window.location.hash === '#edit') {
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    openOverlay();
+  }
 })();
 """
 

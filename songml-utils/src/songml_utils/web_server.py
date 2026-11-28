@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
+import html as _html
 import json
 import os
 import secrets
@@ -14,9 +15,10 @@ import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .chord_voicings import DEFAULT_VOICINGS_PATH, find_local_voicings_path
+from .create import render_song, sanitize_project_name
 from .formatter import cleanup_songml
 from .html_exporter import _CSS, to_html_string
 from .midi_exporter import export_midi
@@ -30,12 +32,80 @@ body{padding:2rem}
 h1{margin-bottom:1rem}
 ul{list-style:none;padding:0;margin:0}
 li{margin:.4rem 0;font-size:1rem}
+li button{font-size:.75rem;padding:.1rem .5rem;margin-left:.25rem;cursor:pointer}
+#fm-new{padding:.3rem .9rem;font-size:.9rem;cursor:pointer}
+#fm-msg{color:#b06000;font-size:.9rem}
 """
 )
+
+# Library page file management (#13): new / rename / delete. Injected only when
+# editing is enabled; __WRITE_TOKEN__ is substituted with a JSON-quoted value.
+_INDEX_JS = """
+(function () {
+  'use strict';
+  var WRITE_TOKEN = __WRITE_TOKEN__;
+  var msg = document.getElementById('fm-msg');
+
+  async function post(route, body) {
+    body.token = WRITE_TOKEN;
+    var resp, data;
+    try {
+      resp = await fetch(route, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      data = await resp.json();
+    } catch (e) {
+      msg.textContent = 'Failed: ' + e;
+      return null;
+    }
+    if (!(resp.ok && data.ok)) {
+      msg.textContent = 'Failed: ' + (data.error || ('HTTP ' + resp.status));
+      return null;
+    }
+    return data;
+  }
+
+  function songUrl(rel) {
+    return '/song/' + rel.split('/').map(encodeURIComponent).join('/');
+  }
+
+  document.getElementById('fm-new').addEventListener('click', async function () {
+    var name = window.prompt('New song name:');
+    if (name === null || !name.trim()) return;
+    var key = window.prompt('Key (e.g. C, F#min, Bb):', 'C');
+    if (key === null) return;
+    var data = await post('/api/create', { name: name, key: key });
+    if (data) window.location.href = songUrl(data.path) + '#edit';
+  });
+
+  document.querySelectorAll('.fm-rename').forEach(function (b) {
+    b.addEventListener('click', async function () {
+      var rel = b.dataset.path;
+      var old = rel.split('/').pop();
+      var name = window.prompt('Rename ' + rel + ' to:', old);
+      if (name === null || !name.trim() || name.trim() === old) return;
+      var data = await post('/api/rename', { path: rel, new_name: name });
+      if (data) window.location.href = songUrl(data.path);
+    });
+  });
+
+  document.querySelectorAll('.fm-delete').forEach(function (b) {
+    b.addEventListener('click', async function () {
+      var rel = b.dataset.path;
+      if (!window.confirm('Delete ' + rel + '? This cannot be undone.')) return;
+      var data = await post('/api/delete', { path: rel });
+      if (data) window.location.reload();
+    });
+  });
+})();
+"""
 
 
 _MAX_SAVE_BYTES = 1_000_000  # max POST /api/save body
 _MAX_MIX_BYTES = 4096  # max POST /api/mix/* body
+_MAX_FILE_OP_BYTES = 4096  # max POST /api/{create,rename,delete} body
 
 # HTTP status for each mix command outcome (design §3.3, §4.2). Every response carries
 # the re-read state, so the page shows what Live reports whatever the outcome.
@@ -76,24 +146,53 @@ class _Handler(BaseHTTPRequestHandler):
             self._handle_save()
         elif path == "/api/format":
             self._handle_format()
+        elif path == "/api/create":
+            self._handle_create()
+        elif path == "/api/rename":
+            self._handle_rename()
+        elif path == "/api/delete":
+            self._handle_delete()
         elif path.startswith("/api/mix/") and path[len("/api/mix/") :] in _MIX_COMMANDS:
             self._handle_mix_command(path[len("/api/mix/") :])
         else:
             self._send(404, "text/plain", b"Not found")
 
     def _serve_index(self):
-        files = sorted(self.__class__.root.rglob("*.songml"))
-        items = "".join(
-            f'<li><a href="/song/{f.relative_to(self.__class__.root)}">'
-            f"{f.relative_to(self.__class__.root)}</a></li>"
-            for f in files
+        root = self.__class__.root
+        token = self.__class__.write_token
+        rels = [f.relative_to(root).as_posix() for f in sorted(root.rglob("*.songml"))]
+        # File management (#13) rides the editing gate: same token, same 503 without it.
+        manage = bool(token)
+        items = []
+        for rel in rels:
+            link = f'<a href="/song/{_html.escape(quote(rel))}">{_html.escape(rel)}</a>'
+            if manage:
+                data = _html.escape(rel, quote=True)
+                link += (
+                    f' <button type="button" class="fm-rename" data-path="{data}">Rename</button>'
+                    f' <button type="button" class="fm-delete" data-path="{data}">Delete</button>'
+                )
+            items.append(f"<li>{link}</li>")
+        new_btn = (
+            '<p><button type="button" id="fm-new">+ New song</button>'
+            ' <span id="fm-msg" role="status"></span></p>'
+            if manage
+            else ""
+        )
+        script = (
+            "<script>\n"
+            + _INDEX_JS.replace("__WRITE_TOKEN__", json.dumps(token).replace("</", "<\\/"))
+            + "\n</script>"
+            if manage
+            else ""
         )
         body = (
             f'<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f"<title>SongML Library</title>"
             f"<style>{_INDEX_CSS}</style></head>"
-            f"<body><div class='song'><h1>SongML Library</h1>"
-            f"<ul>{items}</ul></div></body></html>"
+            f"<body><div class='song'><h1>SongML Library</h1>{new_btn}"
+            f"<ul>{''.join(items)}</ul></div>{script}</body></html>"
         )
         self._send(200, "text/html; charset=utf-8", body.encode())
 
@@ -314,6 +413,107 @@ class _Handler(BaseHTTPRequestHandler):
             "utf-8"
         )
         self._send(200, "application/json", body)
+
+    def _rel(self, target: Path) -> str:
+        return target.relative_to(self.__class__.root.resolve()).as_posix()
+
+    def _handle_create(self):
+        # POST /api/create {"name","key"?,"token"} -> {"ok","path"}. New song at the
+        # song root from data/templates/basic.songml, filled and named exactly as
+        # songml-create does (render_song + sanitize_project_name). Never overwrites.
+        payload = self._read_json_payload(_MAX_FILE_OP_BYTES)
+        if payload is None:
+            return
+        name = payload.get("name")
+        key = payload.get("key") or "C"
+        if not isinstance(name, str) or not name.strip() or not isinstance(key, str):
+            self._send_json(400, {"ok": False, "error": "a song name is required"})
+            return
+        title = name.strip()
+        if title.lower().endswith(".songml"):
+            title = title[: -len(".songml")].strip() or title
+        try:
+            content = render_song(title, key.strip())
+        except ValueError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        # Same file name as songml-create, minus leading dots: no hidden or ".."-ish names.
+        stem = sanitize_project_name(title).lstrip(".-") or "untitled-song"
+        target = self.__class__.root.resolve() / f"{stem}.songml"
+        try:
+            with open(target, "x", encoding="utf-8", newline="") as fh:
+                fh.write(content)
+        except FileExistsError:
+            self._send_json(409, {"ok": False, "error": f"{target.name} already exists"})
+            return
+        except OSError as exc:
+            self._send_json(500, {"ok": False, "error": f"create failed: {exc}"})
+            return
+        self._send_json(200, {"ok": True, "path": self._rel(target)})
+
+    def _handle_rename(self):
+        # POST /api/rename {"path","new_name","token"} -> {"ok","path"}. Renames
+        # within the file's own directory; new_name is a bare file name (".songml"
+        # appended if missing). Refuses to replace an existing file.
+        payload = self._read_json_payload(_MAX_FILE_OP_BYTES)
+        if payload is None:
+            return
+        source = self._song_target_or_error(payload.get("path"))
+        if source is None:
+            return
+        new_name = payload.get("new_name")
+        new_name = new_name.strip() if isinstance(new_name, str) else ""
+        if new_name and not new_name.lower().endswith(".songml"):
+            new_name += ".songml"
+        stem = new_name[: -len(".songml")]
+        if (
+            not stem.strip()
+            or new_name.startswith(".")
+            or any(c in new_name for c in '/\\:<>"|?*')
+            or any(ord(c) < 32 for c in new_name)
+        ):
+            self._send_json(
+                400,
+                {
+                    "ok": False,
+                    "error": "new name must be a plain file name "
+                    '(no folders, no leading dot, none of / \\ : < > " | ? *)',
+                },
+            )
+            return
+        dest = source.parent / new_name
+        if dest.name == source.name:
+            self._send_json(400, {"ok": False, "error": "new name is the same as the old one"})
+            return
+        # A case-only rename on a case-insensitive filesystem sees dest as existing
+        # but it is the same file: allow that, refuse any other existing name.
+        if dest.exists() and not (
+            dest.name.lower() == source.name.lower() and os.path.samefile(dest, source)
+        ):
+            self._send_json(409, {"ok": False, "error": f"{new_name} already exists"})
+            return
+        try:
+            os.rename(source, dest)
+        except OSError as exc:
+            self._send_json(500, {"ok": False, "error": f"rename failed: {exc}"})
+            return
+        self._send_json(200, {"ok": True, "path": self._rel(dest)})
+
+    def _handle_delete(self):
+        # POST /api/delete {"path","token"} -> {"ok","path"}. The browser confirms first.
+        payload = self._read_json_payload(_MAX_FILE_OP_BYTES)
+        if payload is None:
+            return
+        target = self._song_target_or_error(payload.get("path"))
+        if target is None:
+            return
+        rel = self._rel(target)
+        try:
+            target.unlink()
+        except OSError as exc:
+            self._send_json(500, {"ok": False, "error": f"delete failed: {exc}"})
+            return
+        self._send_json(200, {"ok": True, "path": rel})
 
     def _mix_or_404(self) -> MixLayer | None:
         # Without --mixroom the mix routes don't exist (design §4.4).
